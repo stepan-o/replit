@@ -1,0 +1,47 @@
+from pydantic import BaseModel, Field
+from typing import List, Literal, Optional, Dict
+from snapshotter.utils import repo_slug_from_url, utc_ts
+
+class Limits(BaseModel):
+    max_file_bytes: int = 10 * 1024 * 1024
+    max_total_bytes: int = 250 * 1024 * 1024
+    max_files: int = 20000
+
+class Filters(BaseModel):
+    deny_dirs: List[str] = ["node_modules", ".git", ".next", "dist", "build", ".venv"]
+    deny_file_regex: List[str] = [r"(?i).*\.pem$", r"(?i).*\.key$", r"(?i).*id_rsa$"]
+    allow_exts: List[str] = ["*"]
+
+class Output(BaseModel):
+    s3_bucket: str
+    s3_prefix: str
+
+class Metadata(BaseModel):
+    triggered_by: Literal["manual", "langgraph", "cron"] = "manual"
+    notes: Optional[str] = None
+
+class Job(BaseModel):
+    job_id: Optional[str] = None
+    repo_url: str
+    ref: str
+    mode: Literal["full", "light"] = "full"
+    limits: Limits = Field(default_factory=Limits)
+    filters: Filters = Field(default_factory=Filters)
+    output: Output
+    metadata: Metadata = Field(default_factory=Metadata)
+
+    # derived at runtime
+    repo_slug: Optional[str] = None
+    timestamp_utc: Optional[str] = None
+
+    def finalize(self):
+        self.repo_slug = repo_slug_from_url(self.repo_url)
+        self.timestamp_utc = utc_ts()
+        if not self.job_id:
+            # short-ish stable id for paths; OK for v0.1
+            self.job_id = f"{self.timestamp_utc}"
+        return self
+
+    def s3_job_prefix(self) -> str:
+        assert self.repo_slug and self.timestamp_utc and self.job_id
+        return f"{self.output.s3_prefix}/{self.repo_slug}/{self.timestamp_utc}/{self.job_id}"
