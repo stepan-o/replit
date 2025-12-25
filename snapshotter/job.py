@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -11,9 +11,9 @@ class Limits(BaseModel):
     max_files: int = 20000
 
 class Filters(BaseModel):
-    deny_dirs: List[str] = ["node_modules", ".git", ".next", "dist", "build", ".venv"]
-    deny_file_regex: List[str] = [r"(?i).*\.pem$", r"(?i).*\.key$", r"(?i).*id_rsa$"]
-    allow_exts: List[str] = ["*"]
+    deny_dirs: list[str] = ["node_modules", ".git", ".next", "dist", "build", ".venv"]
+    deny_file_regex: list[str] = [r"(?i).*\.pem$", r"(?i).*\.key$", r"(?i).*id_rsa$"]
+    allow_exts: list[str] = ["*"]
 
 class Output(BaseModel):
     s3_bucket: str
@@ -21,10 +21,10 @@ class Output(BaseModel):
 
 class Metadata(BaseModel):
     triggered_by: Literal["manual", "langgraph", "cron"] = "manual"
-    notes: Optional[str] = None
+    notes: str | None = None
 
 class Job(BaseModel):
-    job_id: Optional[str] = None
+    job_id: str | None = None
     repo_url: str
     ref: str
     mode: Literal["full", "light"] = "full"
@@ -34,8 +34,8 @@ class Job(BaseModel):
     metadata: Metadata = Field(default_factory=Metadata)
 
     # derived at runtime
-    repo_slug: Optional[str] = None
-    timestamp_utc: Optional[str] = None
+    repo_slug: str | None = None
+    timestamp_utc: str | None = None
 
     def finalize(self):
         self.repo_slug = repo_slug_from_url(self.repo_url)
