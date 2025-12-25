@@ -1,6 +1,9 @@
+from typing import Dict, List, Literal, Optional
+
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Dict
+
 from snapshotter.utils import repo_slug_from_url, utc_ts
+
 
 class Limits(BaseModel):
     max_file_bytes: int = 10 * 1024 * 1024

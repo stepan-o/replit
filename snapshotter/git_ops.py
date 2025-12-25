@@ -2,6 +2,7 @@ import os
 import subprocess
 from pathlib import Path
 
+
 def run(cmd: list[str], cwd: str | None = None):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if p.returncode != 0:

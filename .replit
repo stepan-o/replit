@@ -24,3 +24,6 @@ args = "uv run python main.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[nix]
+packages = ["libxcrypt"]
