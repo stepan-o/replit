@@ -1,3 +1,4 @@
+import secrets
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -10,18 +11,22 @@ class Limits(BaseModel):
     max_total_bytes: int = 250 * 1024 * 1024
     max_files: int = 20000
 
+
 class Filters(BaseModel):
     deny_dirs: list[str] = ["node_modules", ".git", ".next", "dist", "build", ".venv"]
     deny_file_regex: list[str] = [r"(?i).*\.pem$", r"(?i).*\.key$", r"(?i).*id_rsa$"]
     allow_exts: list[str] = ["*"]
 
+
 class Output(BaseModel):
     s3_bucket: str
     s3_prefix: str
 
+
 class Metadata(BaseModel):
     triggered_by: Literal["manual", "langgraph", "cron"] = "manual"
     notes: str | None = None
+
 
 class Job(BaseModel):
     job_id: str | None = None
@@ -40,9 +45,14 @@ class Job(BaseModel):
     def finalize(self):
         self.repo_slug = repo_slug_from_url(self.repo_url)
         self.timestamp_utc = utc_ts()
+
+        # IMPORTANT:
+        # timestamp_utc is already a path segment, so job_id must NOT equal timestamp_utc
+        # or you get out/<ts>/<ts> and s3/<ts>/<ts>.
         if not self.job_id:
-            # short-ish stable id for paths; OK for v0.1
-            self.job_id = f"{self.timestamp_utc}"
+            # short-ish, unique per run; stable enough for v0.1
+            self.job_id = f"{self.timestamp_utc}-{secrets.token_hex(4)}"
+
         return self
 
     def s3_job_prefix(self) -> str:

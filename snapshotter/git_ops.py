@@ -3,29 +3,38 @@ import subprocess
 from pathlib import Path
 
 
-def run(cmd: list[str], cwd: str | None = None):
+def run(cmd: list[str], cwd: str | None = None) -> str:
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if p.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}")
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
+        )
     return p.stdout.strip()
 
+
 def clone_and_checkout(repo_url: str, ref: str, workdir: str) -> str:
-    Path(workdir).mkdir(parents=True, exist_ok=True)
-    repo_dir = os.path.join(workdir, "repo")
-    if os.path.exists(repo_dir):
-        # clean slate
-        run(["rm", "-rf", repo_dir])
+    """
+    Clone repo into <workdir>/repo and checkout <ref> if possible.
 
-    run(["git", "clone", "--depth", "1", repo_url, repo_dir], cwd=workdir)
+    IMPORTANT: Avoid double-nesting by NEVER using:
+      cwd=workdir + dest=workdir/repo
+    """
+    workdir_path = Path(workdir).resolve()
+    workdir_path.mkdir(parents=True, exist_ok=True)
 
-    # If ref is not the default branch, try fetching it.
-    # (Works for branches/tags; commits may need full fetch later.)
+    repo_dir = workdir_path / "repo"
+    if repo_dir.exists():
+        run(["rm", "-rf", str(repo_dir)])
+
+    # Clone using absolute destination; no cwd tricks -> no double nesting.
+    run(["git", "clone", "--depth", "1", repo_url, str(repo_dir)], cwd=None)
+
+    # Best-effort checkout of ref (branch/tag). If it fails, stay on default.
     try:
-        run(["git", "fetch", "--depth", "1", "origin", ref], cwd=repo_dir)
-        run(["git", "checkout", ref], cwd=repo_dir)
+        run(["git", "fetch", "--depth", "1", "origin", ref], cwd=str(repo_dir))
+        run(["git", "checkout", ref], cwd=str(repo_dir))
     except Exception:
-        # If this fails, still proceed on default branch; resolved_commit will reveal reality.
         pass
 
-    resolved_commit = run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    resolved_commit = run(["git", "rev-parse", "HEAD"], cwd=str(repo_dir))
     return resolved_commit

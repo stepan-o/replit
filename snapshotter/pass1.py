@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from snapshotter.job import Job
+
+# --- NEW: deterministic read-plan suggestions ---
+# Add this new file: snapshotter/read_plan.py (the scorer/selector).
+from snapshotter.read_plan import suggest_files_to_read
 from snapshotter.utils import sha256_bytes, utc_ts
 
 LANG_BY_EXT = {
@@ -24,8 +28,10 @@ LANG_BY_EXT = {
     ".yml": "yaml",
 }
 
-
-IMPORT_RE = re.compile(r"^\s*(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))", re.M)
+IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))",
+    re.M,
+)
 
 
 def infer_language(path: str) -> str:
@@ -165,6 +171,10 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
     files.sort(key=lambda x: x["path"])
     skipped.sort(key=lambda x: x["path"])
 
+    # --- NEW: deterministic Pass 1 read-plan suggestions (for Pass 2 to consume) ---
+    # This should not read more files; it uses the index you already built.
+    read_plan_suggestions = suggest_files_to_read(files, max_files=120)
+
     return {
         "generated_at": utc_ts(),
         "job": {
@@ -184,6 +194,7 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
         },
         "files": files,
         "skipped_files": skipped,
+        "read_plan_suggestions": read_plan_suggestions,
     }
 
 

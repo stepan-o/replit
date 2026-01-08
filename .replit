@@ -27,3 +27,10 @@ outputType = "console"
 
 [nix]
 packages = ["libxcrypt"]
+
+[userenv]
+
+[userenv.shared]
+SNAPSHOTTER_S3_PREFIX = "repo-scans/snapshotter"
+SNAPSHOTTER_DRY_RUN = "false"
+SNAPSHOTTER_REF = "main"

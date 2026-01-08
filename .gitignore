@@ -34,3 +34,6 @@ Thumbs.db
 .pytest_cache/
 
 uv.lock
+
+.snapshotter_tmp/
+out/
