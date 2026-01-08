@@ -10,8 +10,7 @@ from typing import Any
 
 from snapshotter.job import Job
 
-# --- NEW: deterministic read-plan suggestions ---
-# Add this new file: snapshotter/read_plan.py (the scorer/selector).
+# deterministic read-plan suggestions
 from snapshotter.read_plan import suggest_files_to_read
 from snapshotter.utils import sha256_bytes, utc_ts
 
@@ -54,7 +53,6 @@ def parse_python_defs_and_imports(text: str) -> tuple[list[str], list[str]]:
                 if node.module:
                     imports.append(node.module)
     except Exception:
-        # keep best-effort; caller can flag unknowns if needed
         pass
     return defs, sorted(set(imports))
 
@@ -85,7 +83,6 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
         skipped.append({"path": rel_path, "reason": reason, "bytes": size or 0})
 
     for root, dirs, filenames in os.walk(repo_dir):
-        # directory filtering
         dirs[:] = [d for d in dirs if d not in deny_dirs]
 
         for fn in filenames:
@@ -97,12 +94,10 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
             rel_path = os.path.relpath(abs_path, repo_dir)
             files_scanned += 1
 
-            # deny-file regex
             if any(rx.match(rel_path) for rx in deny_file_regex):
                 record_skip(rel_path, "deny_file_regex")
                 continue
 
-            # allow ext filter
             ext = Path(rel_path).suffix.lower().lstrip(".")
             if not allow_all and ext not in allow_exts:
                 record_skip(rel_path, "ext_not_allowed")
@@ -122,7 +117,6 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                 record_skip(rel_path, "max_total_bytes_exceeded", size)
                 continue
 
-            # Read file
             try:
                 raw = Path(abs_path).read_bytes()
             except Exception:
@@ -132,7 +126,6 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
             sha = sha256_bytes(raw)
             language = infer_language(rel_path)
 
-            # imports + defs
             imports: list[str] = []
             top_defs: list[str] = []
             flags: list[str] = []
@@ -144,11 +137,9 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                 except Exception:
                     flags.append("python_parse_failed")
             else:
-                # best-effort for JS/TS/etc
                 try:
                     text = raw.decode("utf-8", errors="replace")
                     imports = parse_best_effort_imports(text)
-                    # defs unknown unless we add parsers later
                     flags.append("top_level_defs_unknown")
                 except Exception:
                     flags.append("text_decode_failed")
@@ -167,25 +158,19 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                 }
             )
 
-    # determinism
     files.sort(key=lambda x: x["path"])
     skipped.sort(key=lambda x: x["path"])
 
-    # --- NEW: deterministic Pass 1 read-plan suggestions (for Pass 2 to consume) ---
-    # This should not read more files; it uses the index you already built.
     read_plan_suggestions = suggest_files_to_read(files, max_files=120)
+
+    # Job contract: payload + derived fields live under repo_index.job
+    job_block = job.model_dump()
+    # main.py patches this after clone
+    job_block["resolved_commit"] = "unknown"
 
     return {
         "generated_at": utc_ts(),
-        "job": {
-            "job_id": job.job_id,
-            "repo_url": job.repo_url,
-            "requested_ref": job.ref,
-            "resolved_commit": "unknown",  # main.py will patch this after clone
-            "repo_slug": job.repo_slug,
-        },
-        "limits": job.limits.model_dump(),
-        "filters": job.filters.model_dump(),
+        "job": job_block,
         "counts": {
             "files_scanned": files_scanned,
             "files_included": files_included,

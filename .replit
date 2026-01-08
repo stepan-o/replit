@@ -31,6 +31,5 @@ packages = ["libxcrypt"]
 [userenv]
 
 [userenv.shared]
-SNAPSHOTTER_S3_PREFIX = "repo-scans/snapshotter"
 SNAPSHOTTER_DRY_RUN = "false"
-SNAPSHOTTER_REF = "main"
+SNAPSHOTTER_JOB_JSON = '{   "repo_url": "https://github.com/stepan-o/fruitful-lab.git",   "ref": "main",   "mode": "full",   "limits": {     "max_file_bytes": 10485760,     "max_total_bytes": 262144000,     "max_files": 20000   },   "filters": {     "deny_dirs": ["node_modules", ".git", ".next", "dist", "build", ".venv"],     "deny_file_regex": ["(?i).*\\.pem$", "(?i).*\\.key$", "(?i).*id_rsa$"],     "allow_exts": ["*"]   },   "output": {     "s3_bucket": "fruitful-lab-snapshots-prod",     "s3_prefix": "repo-scans/snapshotter"   },   "metadata": {     "triggered_by": "manual",     "notes": "replit run"   } }'

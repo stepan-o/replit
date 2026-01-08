@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Literal, Optional, cast
 
 from dotenv import load_dotenv
 
 from snapshotter.git_ops import clone_and_checkout
-from snapshotter.job import Job, Output
+from snapshotter.job import Job
 from snapshotter.pass1 import build_repo_index, write_json
 from snapshotter.s3_uploader import S3Uploader
 from snapshotter.utils import sha256_bytes
@@ -19,6 +20,7 @@ from snapshotter.validate_basic import validate_basic_artifacts
 # Stages (canonical)
 # -----------------------------
 STAGE_INIT = "init"
+STAGE_PARSE_JOB = "parse_job"
 STAGE_CLONE = "clone"
 STAGE_PASS1_REPO_INDEX = "pass1_repo_index"
 STAGE_PASS2_STUB = "pass2_stub"
@@ -30,10 +32,7 @@ STAGE_DONE_DRY_RUN = "done_dry_run"
 
 
 def utc_ts() -> str:
-    # Prefer your existing helper if you want; keeping local avoids import churn.
-    # If you want to use snapshotter.utils.utc_ts, swap this out.
     from snapshotter.utils import utc_ts as _utc_ts
-
     return _utc_ts()
 
 
@@ -41,15 +40,6 @@ def parse_bool(v: str | None, default: bool = False) -> bool:
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def parse_mode(v: str | None, default: Literal["full", "light"] = "full") -> Literal["full", "light"]:
-    if not v:
-        return default
-    vv = v.strip().lower()
-    if vv in ("full", "light"):
-        return cast(Literal["full", "light"], vv)
-    return default
 
 
 def file_sha256(path: str | Path) -> str:
@@ -132,41 +122,60 @@ def _print_failure(stage: str, err: Exception) -> None:
     print(json.dumps(out, indent=2))
 
 
+def _read_job_payload_json_required() -> tuple[dict[str, Any], str]:
+    """
+    Canonical job input (MANDATORY):
+      1) SNAPSHOTTER_JOB_JSON env (JSON string)
+      2) SNAPSHOTTER_JOB_FILE env (path to JSON file)
+      3) stdin (if piped)
+    """
+    raw = os.environ.get("SNAPSHOTTER_JOB_JSON")
+    if raw and raw.strip():
+        return json.loads(raw), "env:SNAPSHOTTER_JOB_JSON"
+
+    job_file = os.environ.get("SNAPSHOTTER_JOB_FILE")
+    if job_file and job_file.strip():
+        p = Path(job_file)
+        return json.loads(p.read_text(encoding="utf-8")), f"file:{p}"
+
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        if data and data.strip():
+            return json.loads(data), "stdin"
+
+    raise RuntimeError(
+        "Missing required job payload. Provide one of: "
+        "SNAPSHOTTER_JOB_JSON (env), SNAPSHOTTER_JOB_FILE (env path), or pipe JSON to stdin."
+    )
+
+
+def _job_from_payload(payload: dict[str, Any]) -> Job:
+    # pydantic v2
+    return Job.model_validate(payload).finalize()
+
+
 def main() -> None:
-    load_dotenv()  # harmless in Replit; useful locally
+    load_dotenv()
 
     stage = STAGE_INIT
 
     try:
-        # --- env ---
-        repo_url = os.environ["SNAPSHOTTER_REPO_URL"]
-        ref = os.environ.get("SNAPSHOTTER_REF", "main")
-
-        bucket = os.environ["SNAPSHOTTER_S3_BUCKET"]
-        prefix = os.environ.get("SNAPSHOTTER_S3_PREFIX", "repo-scans/snapshotter")
-
         dry_run = parse_bool(os.environ.get("SNAPSHOTTER_DRY_RUN"), default=False)
         aws_region = os.environ.get("AWS_REGION")  # optional
 
-        mode = parse_mode(os.environ.get("SNAPSHOTTER_MODE"), default="full")
+        # --- parse job (payload authoritative + required) ---
+        stage = STAGE_PARSE_JOB
+        payload, payload_src = _read_job_payload_json_required()
+        job = _job_from_payload(payload)
 
-        # --- job ---
-        job = Job(
-            job_id=os.environ.get("SNAPSHOTTER_JOB_ID"),
-            repo_url=repo_url,
-            ref=ref,
-            mode=mode,
-            output=Output(s3_bucket=bucket, s3_prefix=prefix),
-        ).finalize()
-
-        # --- dirs (workspace-visible) ---
+        # --- dirs ---
         workdir = ".snapshotter_tmp"
         repo_dir = os.path.join(workdir, "repo")
         out_dir = os.path.join("out", job.repo_slug or "repo", job.timestamp_utc or "ts", job.job_id or "job")
         Path(workdir).mkdir(parents=True, exist_ok=True)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-        # local artifact paths (NO TARBALL)
+        # local artifact paths
         local_repo_index = os.path.join(out_dir, "repo_index.json")
         local_manifest = os.path.join(out_dir, "artifact_manifest.json")
         local_arch = os.path.join(out_dir, "ARCHITECTURE_SUMMARY_SNAPSHOT.json")
@@ -183,7 +192,7 @@ def main() -> None:
         repo_index["job"]["resolved_commit"] = resolved_commit
         write_json(local_repo_index, repo_index)
 
-        # --- pass2: stub semantic artifacts ---
+        # --- pass2: stubs ---
         stage = STAGE_PASS2_STUB
         arch_stub = build_architecture_summary_snapshot_stub(
             repo_url=job.repo_url,
@@ -200,7 +209,7 @@ def main() -> None:
             build_onboarding_stub(repo_url=job.repo_url, resolved_commit=resolved_commit), encoding="utf-8"
         )
 
-        # --- artifact_manifest (includes pass2 stubs) ---
+        # --- manifest ---
         stage = STAGE_PASS1_MANIFEST
         manifest = build_artifact_manifest(
             {
@@ -212,7 +221,7 @@ def main() -> None:
         )
         write_json(local_manifest, manifest)
 
-        # --- validate_basic ---
+        # --- validate ---
         stage = STAGE_VALIDATE_BASIC
         validate_basic_artifacts(
             {
@@ -224,36 +233,35 @@ def main() -> None:
             }
         )
 
-        # --- hashes ---
         repo_index_sha = file_sha256(local_repo_index)
 
-        # --- uploader (SSE=AES256 enforced in S3Uploader) ---
-        uploader = S3Uploader(bucket=bucket, prefix=job.s3_job_prefix(), region=aws_region)
+        uploader = S3Uploader(bucket=job.output.s3_bucket, prefix=job.s3_job_prefix(), region=aws_region)
 
         if dry_run:
             stage = STAGE_DONE_DRY_RUN
-            out = {
-                "ok": True,
-                "stage": stage,
-                "job_id": job.job_id,
-                "repo_url": job.repo_url,
-                "requested_ref": job.ref,
-                "resolved_commit": resolved_commit,
-                "s3_bucket": bucket,
-                "s3_prefix": job.s3_job_prefix(),
-                "artifacts": {
-                    "repo_index_local": local_repo_index,
-                    "artifact_manifest_local": local_manifest,
-                    "architecture_snapshot_local": local_arch,
-                    "gaps_local": local_gaps,
-                    "onboarding_local": local_onboarding,
-                },
-                "hashes": {"repo_index_sha256": repo_index_sha},
-            }
-            _print_success(out)
+            _print_success(
+                {
+                    "ok": True,
+                    "stage": stage,
+                    "job_id": job.job_id,
+                    "repo_url": job.repo_url,
+                    "requested_ref": job.ref,
+                    "resolved_commit": resolved_commit,
+                    "s3_bucket": job.output.s3_bucket,
+                    "s3_prefix": job.s3_job_prefix(),
+                    "job_payload_source": payload_src,
+                    "artifacts": {
+                        "repo_index_local": local_repo_index,
+                        "artifact_manifest_local": local_manifest,
+                        "architecture_snapshot_local": local_arch,
+                        "gaps_local": local_gaps,
+                        "onboarding_local": local_onboarding,
+                    },
+                    "hashes": {"repo_index_sha256": repo_index_sha},
+                }
+            )
             return
 
-        # --- real uploads ---
         stage = STAGE_UPLOAD
         s3_paths: dict[str, Optional[str]] = {
             "repo_index": uploader.upload_file("repo_index.json", local_repo_index, content_type="application/json"),
@@ -268,25 +276,27 @@ def main() -> None:
         }
 
         stage = STAGE_DONE
-        out = {
-            "ok": True,
-            "stage": stage,
-            "job_id": job.job_id,
-            "repo_url": job.repo_url,
-            "requested_ref": job.ref,
-            "resolved_commit": resolved_commit,
-            "s3_bucket": bucket,
-            "s3_prefix": job.s3_job_prefix(),
-            "artifacts": {
-                "repo_index": s3_paths["repo_index"],
-                "artifact_manifest": s3_paths["artifact_manifest"],
-                "architecture_snapshot": s3_paths["architecture_snapshot"],
-                "gaps": s3_paths["gaps"],
-                "onboarding": s3_paths["onboarding"],
-            },
-            "hashes": {"repo_index_sha256": repo_index_sha},
-        }
-        _print_success(out)
+        _print_success(
+            {
+                "ok": True,
+                "stage": stage,
+                "job_id": job.job_id,
+                "repo_url": job.repo_url,
+                "requested_ref": job.ref,
+                "resolved_commit": resolved_commit,
+                "s3_bucket": job.output.s3_bucket,
+                "s3_prefix": job.s3_job_prefix(),
+                "job_payload_source": payload_src,
+                "artifacts": {
+                    "repo_index": s3_paths["repo_index"],
+                    "artifact_manifest": s3_paths["artifact_manifest"],
+                    "architecture_snapshot": s3_paths["architecture_snapshot"],
+                    "gaps": s3_paths["gaps"],
+                    "onboarding": s3_paths["onboarding"],
+                },
+                "hashes": {"repo_index_sha256": repo_index_sha},
+            }
+        )
 
     except Exception as e:
         _print_failure(stage, e)
