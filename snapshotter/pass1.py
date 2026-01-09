@@ -12,7 +12,7 @@ from snapshotter.job import Job
 
 # deterministic read-plan suggestions
 from snapshotter.read_plan import suggest_files_to_read
-from snapshotter.utils import sha256_bytes, utc_ts
+from snapshotter.utils import is_probably_binary, sha256_bytes, utc_ts
 
 LANG_BY_EXT = {
     ".py": "python",
@@ -79,22 +79,35 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
     allow_all = "*" in job.filters.allow_exts
     allow_exts = set([e.lower().lstrip(".") for e in job.filters.allow_exts if e != "*"])
 
+    # v0.1: binary is skipped unless explicitly allowed
+    allow_binary = bool(getattr(job.filters, "allow_binary", False))
+
+    max_files_reached = False
+
     def record_skip(rel_path: str, reason: str, size: int | None = None):
         skipped.append({"path": rel_path, "reason": reason, "bytes": size or 0})
 
     for root, dirs, filenames in os.walk(repo_dir):
-        dirs[:] = [d for d in dirs if d not in deny_dirs]
+        # Deterministic traversal: os.walk order is not guaranteed.
+        dirs[:] = sorted([d for d in dirs if d not in deny_dirs])
+        filenames = sorted(filenames)
+
+        if max_files_reached:
+            break
 
         for fn in filenames:
             if files_scanned >= job.limits.max_files:
-                record_skip("*", "max_files_reached")
+                if not max_files_reached:
+                    record_skip("*", "max_files_reached")
+                    max_files_reached = True
                 break
 
             abs_path = os.path.join(root, fn)
-            rel_path = os.path.relpath(abs_path, repo_dir)
+            rel_path = os.path.relpath(abs_path, repo_dir).replace("\\", "/")
             files_scanned += 1
 
-            if any(rx.match(rel_path) for rx in deny_file_regex):
+            # deny regex should use search(), not match()
+            if any(rx.search(rel_path) for rx in deny_file_regex):
                 record_skip(rel_path, "deny_file_regex")
                 continue
 
@@ -121,6 +134,11 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                 raw = Path(abs_path).read_bytes()
             except Exception:
                 record_skip(rel_path, "read_failed", size)
+                continue
+
+            # Binary detection (skip unless explicitly allowed)
+            if (not allow_binary) and is_probably_binary(raw):
+                record_skip(rel_path, "binary_file", size)
                 continue
 
             sha = sha256_bytes(raw)
@@ -157,6 +175,9 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                     "flags": flags,
                 }
             )
+
+        if max_files_reached:
+            break
 
     files.sort(key=lambda x: x["path"])
     skipped.sort(key=lambda x: x["path"])

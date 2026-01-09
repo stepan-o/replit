@@ -1,10 +1,9 @@
 import os
 import re
-import fnmatch
 from pathlib import Path
 from typing import Iterator
 
-from snapshotter.job import Job, Filters, Limits
+from snapshotter.job import Filters, Job
 from snapshotter.utils import sha256_bytes
 
 
@@ -13,8 +12,9 @@ def should_skip_dir(dirname: str, filters: Filters) -> bool:
 
 
 def should_skip_file(filepath: str, filters: Filters) -> bool:
+    fp = filepath.replace("\\", "/")
     for pattern in filters.deny_file_regex:
-        if re.match(pattern, filepath):
+        if re.search(pattern, fp):
             return True
     return False
 
@@ -33,14 +33,15 @@ def scan_repo(repo_dir: str, job: Job) -> Iterator[dict]:
     file_count = 0
 
     for root, dirs, files in os.walk(repo_dir):
-        dirs[:] = [d for d in dirs if not should_skip_dir(d, filters)]
+        dirs[:] = sorted([d for d in dirs if not should_skip_dir(d, filters)])
+        files = sorted(files)
 
         for filename in files:
             if file_count >= limits.max_files:
                 return
 
             filepath = os.path.join(root, filename)
-            rel_path = os.path.relpath(filepath, repo_dir)
+            rel_path = os.path.relpath(filepath, repo_dir).replace("\\", "/")
 
             if should_skip_file(rel_path, filters):
                 continue

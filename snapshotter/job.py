@@ -14,8 +14,21 @@ class Limits(BaseModel):
 
 class Filters(BaseModel):
     deny_dirs: list[str] = ["node_modules", ".git", ".next", "dist", "build", ".venv"]
-    deny_file_regex: list[str] = [r"(?i).*\.pem$", r"(?i).*\.key$", r"(?i).*id_rsa$"]
+    deny_file_regex: list[str] = [
+        # key material
+        r"(?i).*\.pem$",
+        r"(?i).*\.key$",
+        r"(?i).*id_rsa$",
+        # env secrets (".env", ".env.local", ".env.production", etc.)
+        r"(?i)(^|/)\.env(\..*)?$",
+        # common credential filenames (requested)
+        r"(?i)(^|/)credentials\.json$",
+        r"(?i)(^|/)service[_-]?account.*\.json$",
+    ]
     allow_exts: list[str] = ["*"]
+
+    # v0.1 safety: binary files are skipped unless explicitly allowed
+    allow_binary: bool = False
 
 
 class Output(BaseModel):
