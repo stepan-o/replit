@@ -1,7 +1,10 @@
+# snapshotter/utils.py
 import hashlib
+import json
 import os
 import re
 from datetime import datetime, timezone
+from typing import Any
 
 
 def utc_ts() -> str:
@@ -58,3 +61,48 @@ def repo_slug_from_url(repo_url: str) -> str:
 def getenv(name: str, default: str | None = None) -> str | None:
     v = os.getenv(name)
     return v if v is not None else default
+
+
+# -----------------------------
+# Stable fingerprint helpers
+# -----------------------------
+
+VOLATILE_KEYS_DEFAULT = {"generated_at", "job_id", "timestamp_utc"}
+
+
+def sha256_text(s: str) -> str:
+    return sha256_bytes(s.encode("utf-8"))
+
+
+def _strip_volatile(obj: Any, volatile_keys: set[str]) -> Any:
+    """
+    Recursively remove volatile keys from dicts/lists.
+    Used to build a stable fingerprint across reruns.
+    """
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k in volatile_keys:
+                continue
+            out[k] = _strip_volatile(v, volatile_keys)
+        return out
+    if isinstance(obj, list):
+        return [_strip_volatile(x, volatile_keys) for x in obj]
+    return obj
+
+
+def stable_json_fingerprint_sha256(obj: Any, volatile_keys: set[str] | None = None) -> str:
+    """
+    Stable hash for JSON-like objects where only volatile keys differ between reruns.
+    - strips volatile keys recursively
+    - canonicalizes JSON (sort_keys + stable separators)
+    """
+    vk = volatile_keys or set(VOLATILE_KEYS_DEFAULT)
+    stripped = _strip_volatile(obj, vk)
+    canonical = json.dumps(
+        stripped,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return sha256_text(canonical)

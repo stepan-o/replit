@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Literal, Optional, cast
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 
@@ -13,7 +13,7 @@ from snapshotter.git_ops import clone_and_checkout
 from snapshotter.job import Job
 from snapshotter.pass1 import build_repo_index, write_json
 from snapshotter.s3_uploader import S3Uploader
-from snapshotter.utils import sha256_bytes
+from snapshotter.utils import sha256_bytes, stable_json_fingerprint_sha256
 from snapshotter.validate_basic import validate_basic_artifacts
 
 # -----------------------------
@@ -46,25 +46,57 @@ def file_sha256(path: str | Path) -> str:
     return sha256_bytes(Path(path).read_bytes())
 
 
+def _stable_fingerprint_for_artifact(path: Path) -> str:
+    """
+    Stable fingerprint that ignores volatile keys for JSON artifacts.
+    For non-JSON artifacts, returns the raw bytes sha256.
+    """
+    raw = path.read_bytes()
+    if path.suffix.lower() == ".json":
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+            return stable_json_fingerprint_sha256(obj)
+        except Exception:
+            # fallback: if JSON parse fails, treat as raw bytes
+            return sha256_bytes(raw)
+    return sha256_bytes(raw)
+
+
 def build_artifact_manifest(local_paths: dict[str, Optional[str]]) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
+    stable_fingerprints: dict[str, str] = {}
+
     for name, p in local_paths.items():
         if not p:
             continue
         path = Path(p)
         if not path.exists():
             continue
-        b = path.read_bytes()
+
+        raw = path.read_bytes()
         items.append(
             {
                 "name": name,
                 "filename": path.name,
-                "bytes": len(b),
-                "sha256": sha256_bytes(b),
+                "bytes": len(raw),
+                "sha256": sha256_bytes(raw),  # exact bytes integrity hash
             }
         )
+
+        stable_fingerprints[name] = _stable_fingerprint_for_artifact(path)
+
     items.sort(key=lambda x: x["name"])  # determinism
-    return {"generated_at": utc_ts(), "items": items}
+
+    # A single “equivalence” value you can compare across reruns:
+    # If repo_index stable fingerprint matches, the scan result is identical modulo timestamps/job ids.
+    run_fingerprint_sha256 = stable_fingerprints.get("repo_index", "")
+
+    return {
+        "generated_at": utc_ts(),
+        "items": items,
+        "stable_fingerprints": stable_fingerprints,
+        "run_fingerprint_sha256": run_fingerprint_sha256,
+    }
 
 
 def build_architecture_summary_snapshot_stub(
