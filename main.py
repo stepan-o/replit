@@ -33,6 +33,7 @@ STAGE_DONE_DRY_RUN = "done_dry_run"
 
 def utc_ts() -> str:
     from snapshotter.utils import utc_ts as _utc_ts
+
     return _utc_ts()
 
 
@@ -204,6 +205,27 @@ def main() -> None:
         # --- parse job (payload authoritative + required) ---
         stage = STAGE_PARSE_JOB
         payload, payload_src = _read_job_payload_json_required()
+
+        # --- LangGraph path (opt-in) ---
+        use_langgraph = parse_bool(os.environ.get("SNAPSHOTTER_USE_LANGGRAPH"), default=False)
+        if use_langgraph:
+            # Import only when needed so linear users don't pay import cost / dependency issues.
+            from snapshotter.graph import SnapshotterStageError, run_snapshotter_graph
+
+            try:
+                out = run_snapshotter_graph(
+                    payload=payload,
+                    payload_src=payload_src,
+                    dry_run=dry_run,
+                    aws_region=aws_region,
+                )
+                _print_success(out)
+                return
+            except SnapshotterStageError as se:
+                _print_failure(se.stage, se)
+                raise SystemExit(1) from se
+
+        # --- Linear path (baseline) ---
         job = _job_from_payload(payload)
 
         # --- dirs ---

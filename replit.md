@@ -10,6 +10,7 @@ Snapshotter clones a git repository, builds a deterministic repo index + stub Pa
 ├── snapshotter/
 │   ├── job.py               # Job configuration models (Pydantic)
 │   ├── git_ops.py           # Git clone/checkout operations
+│   ├── graph.py             # LangGraph graph + nodes + state + stage-aware errors
 │   ├── pass1.py             # Pass 1 repo index builder (bounded scan)
 │   ├── read_plan.py         # Deterministic Pass 1 read-plan suggestions
 │   ├── s3_uploader.py       # S3 upload utilities (SSE=AES256 enforced)
