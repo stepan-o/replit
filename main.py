@@ -87,9 +87,15 @@ def build_artifact_manifest(local_paths: dict[str, Optional[str]]) -> dict[str, 
 
     items.sort(key=lambda x: x["name"])  # determinism
 
-    # A single “equivalence” value you can compare across reruns:
-    # If repo_index stable fingerprint matches, the scan result is identical modulo timestamps/job ids.
-    run_fingerprint_sha256 = stable_fingerprints.get("repo_index", "")
+    # Stable “equivalence” fingerprint for the whole run (all artifacts),
+    # independent of timestamps/job_ids inside the JSON artifacts.
+    canonical = json.dumps(
+        stable_fingerprints,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    run_fingerprint_sha256 = sha256_bytes(canonical)
 
     return {
         "generated_at": utc_ts(),

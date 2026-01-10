@@ -35,8 +35,8 @@ AWS credentials (v0.1):
   },
   "filters": {
     "deny_dirs": ["node_modules", ".git", ".next", "dist", "build", ".venv"],
-    "deny_file_regex": ["(?i).*\\.pem$", "(?i).*\\.key$", "(?i).*id_rsa$"],
-    "allow_exts": ["*"]
+    "allow_exts": ["*"],
+    "allow_binary": false
   },
   "output": {
     "s3_bucket": "YOUR_BUCKET_NAME",
@@ -57,6 +57,10 @@ Snapshotter generates these artifacts:
 - `GAPS_AND_INCONSISTENCIES.json`
 - `ONBOARDING.md`
 
+Notes:
+- `artifact_manifest.json` includes per-artifact integrity hashes (`sha256`) and stable equivalence hashes (`stable_fingerprints`), plus a `run_fingerprint_sha256` you can compare across reruns.
+- Raw `sha256` is byte integrity and will differ for JSON artifacts containing timestamps/job ids; use stable_fingerprints / run_fingerprint_sha256 to compare reruns.
+
 Local output directory (workspace):
 - `out/<repo_slug>/<timestamp_utc>/<job_id>/...`
 
@@ -71,10 +75,9 @@ Set:
 - `SNAPSHOTTER_DRY_RUN=true`
 
 Provide job payload (Replit Secrets):
-- `SNAPSHOTTER_JOB_JSON = (paste the JSON payload)`
+- `SNAPSHOTTER_JOB_JSON` = (paste the JSON payload)
 
 Run:
-
 ```bash
 uv run python main.py
 ```
@@ -98,21 +101,21 @@ uv run python main.py
 ```
 
 Expected:
-- Process prints a single JSON object with `"ok": true`
-- `"stage"` is `"done"`
-- `"artifacts"` contains `s3://...` URIs for the 5 artifacts above
+- Process prints a single JSON object with "ok": true
+- "stage" is "done"
+- "artifacts" contains s3://... URIs for the 5 artifacts above
 - Objects exist in S3 under the computed job prefix
 
 ## LangGraph / stdin one-liner (recommended)
 Dry-run:
 ```bash
-echo '{"repo_url":"https://github.com/stepan-o/fruitful-lab.git","ref":"main","mode":"full","limits":{"max_file_bytes":10485760,"max_total_bytes":262144000,"max_files":20000},"filters":{"deny_dirs":["node_modules",".git",".next","dist","build",".venv"],"deny_file_regex":["(?i).*\\.pem$","(?i).*\\.key$","(?i).*id_rsa$"],"allow_exts":["*"]},"output":{"s3_bucket":"YOUR_BUCKET_NAME","s3_prefix":"repo-scans/snapshotter"},"metadata":{"triggered_by":"langgraph","notes":"stdin baseline"}}' \
+echo '{"repo_url":"https://github.com/stepan-o/fruitful-lab.git","ref":"main","mode":"full","limits":{"max_file_bytes":10485760,"max_total_bytes":262144000,"max_files":20000},"filters":{"deny_dirs":["node_modules",".git",".next","dist","build",".venv"],"allow_exts":["*"],"allow_binary":false},"output":{"s3_bucket":"YOUR_BUCKET_NAME","s3_prefix":"repo-scans/snapshotter"},"metadata":{"triggered_by":"langgraph","notes":"stdin baseline"}}' \
 | SNAPSHOTTER_DRY_RUN=true uv run python main.py
 ```
 
 Real upload:
 ```bash
-echo '{"repo_url":"https://github.com/stepan-o/fruitful-lab.git","ref":"main","mode":"full","limits":{"max_file_bytes":10485760,"max_total_bytes":262144000,"max_files":20000},"filters":{"deny_dirs":["node_modules",".git",".next","dist","build",".venv"],"deny_file_regex":["(?i).*\\.pem$","(?i).*\\.key$","(?i).*id_rsa$"],"allow_exts":["*"]},"output":{"s3_bucket":"YOUR_BUCKET_NAME","s3_prefix":"repo-scans/snapshotter"},"metadata":{"triggered_by":"langgraph","notes":"stdin baseline"}}' \
+echo '{"repo_url":"https://github.com/stepan-o/fruitful-lab.git","ref":"main","mode":"full","limits":{"max_file_bytes":10485760,"max_total_bytes":262144000,"max_files":20000},"filters":{"deny_dirs":["node_modules",".git",".next","dist","build",".venv"],"allow_exts":["*"],"allow_binary":false},"output":{"s3_bucket":"YOUR_BUCKET_NAME","s3_prefix":"repo-scans/snapshotter"},"metadata":{"triggered_by":"langgraph","notes":"stdin baseline"}}' \
 | SNAPSHOTTER_DRY_RUN=false uv run python main.py
 ```
 

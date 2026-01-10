@@ -13,7 +13,7 @@ Snapshotter clones a git repository, builds a deterministic repo index + stub Pa
 │   ├── pass1.py             # Pass 1 repo index builder (bounded scan)
 │   ├── read_plan.py         # Deterministic Pass 1 read-plan suggestions
 │   ├── s3_uploader.py       # S3 upload utilities (SSE=AES256 enforced)
-│   └── utils.py             # Helpers (timestamps, hashing, repo slug)
+│   └── utils.py             # Helpers (timestamps, hashing, repo slug, binary detection, stable fingerprints)
 │   └── validate_basic.py    # Basic artifact sanity validation
 ```
 
@@ -52,7 +52,7 @@ uv run python main.py
 
 ### Stdin (LangGraph-friendly)
 ```bash
-echo '{"repo_url":"https://github.com/stepan-o/fruitful-lab.git","ref":"main","mode":"full","limits":{"max_file_bytes":10485760,"max_total_bytes":262144000,"max_files":20000},"filters":{"deny_dirs":["node_modules",".git",".next","dist","build",".venv"],"deny_file_regex":["(?i).*\\.pem$","(?i).*\\.key$","(?i).*id_rsa$"],"allow_exts":["*"]},"output":{"s3_bucket":"YOUR_BUCKET","s3_prefix":"repo-scans/snapshotter"},"metadata":{"triggered_by":"langgraph","notes":"stdin run"}}' \
+echo '{"repo_url":"https://github.com/stepan-o/fruitful-lab.git","ref":"main","mode":"full","limits":{"max_file_bytes":10485760,"max_total_bytes":262144000,"max_files":20000},"filters":{"deny_dirs":["node_modules",".git",".next","dist","build",".venv"],"allow_exts":["*"],"allow_binary":false},"output":{"s3_bucket":"YOUR_BUCKET","s3_prefix":"repo-scans/snapshotter"},"metadata":{"triggered_by":"langgraph","notes":"stdin run"}}' \
 | SNAPSHOTTER_DRY_RUN=true uv run python main.py
 ```
 
@@ -74,7 +74,6 @@ Local clone directory:
 
 ### S3 output structure
 Artifacts are uploaded to:
-
 ```
 s3://{bucket}/{s3_prefix}/{repo_slug}/{timestamp_utc}/{job_id}/
 ├── repo_index.json
@@ -83,6 +82,12 @@ s3://{bucket}/{s3_prefix}/{repo_slug}/{timestamp_utc}/{job_id}/
 ├── GAPS_AND_INCONSISTENCIES.json
 └── ONBOARDING.md
 ```
+
+### artifact_manifest stability notes
+- `items[*].sha256` is the exact-bytes integrity hash (will change if the artifact contains timestamps / job ids).
+- `stable_fingerprints` provides per-artifact “equivalence” hashes intended to remain stable across reruns when content is identical modulo volatile fields.
+- `run_fingerprint_sha256` is the single value to compare across runs (currently based on the stable fingerprint of `repo_index`).
+- Raw `sha256` is byte integrity and will differ for JSON artifacts containing timestamps/job ids; use stable_fingerprints / run_fingerprint_sha256 to compare reruns.
 
 ### Result Contract (stdout)
 On success (dry-run):
@@ -93,7 +98,7 @@ On success (dry-run):
 On success (real upload):
 - `ok=true`
 - `stage="done"`
-- artifacts contains `s3://...` URIs
+- artifacts contains `s3://... URIs`
 
 On failure:
 - `ok=false`
@@ -103,3 +108,4 @@ On failure:
 
 ## Recent Changes
 - 2026-01-08: Switched to single job payload input (env/stdin/file); removed tarball output; workspace-local outputs under `out/...` and `.snapshotter_tmp/...`; enforced AES256 SSE for S3 uploads.
+- 2026-01-10: Pass 1 safety/bounds improvements (deny regex uses search, secret filename coverage, binary skipping via `allow_binary=false`); artifact manifest now includes stable fingerprints for cross-run equivalence checks.
