@@ -1,6 +1,7 @@
 # snapshotter/graph.py
 from __future__ import annotations
 
+import codecs
 import json
 import os
 from dataclasses import dataclass
@@ -74,6 +75,14 @@ class SnapshotterState(TypedDict, total=False):
     read_plan_missing: list[str]
     file_contents_map: dict[str, str]
 
+    # pass2 fetch reporting
+    pass2_total_chars: int
+    pass2_files_read: list[dict[str, Any]]           # [{path, chars, truncated}]
+    pass2_not_read_reasons: dict[str, str]           # {path: reason}
+
+    # pass2 planning debug (optional)
+    pass2_read_plan_debug: dict[str, Any]
+
     # upload/output
     s3_paths: dict[str, Optional[str]]
     result: dict[str, Any]
@@ -134,6 +143,150 @@ def build_artifact_manifest(local_paths: dict[str, Optional[str]]) -> dict[str, 
     }
 
 
+def _repo_index_included_paths(repo_index: dict[str, Any]) -> list[str]:
+    files = repo_index.get("files", []) or []
+    out: list[str] = []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        p = f.get("path")
+        if isinstance(p, str) and p:
+            out.append(p)
+    return sorted(out)
+
+
+def _pass2_defaults_from_env() -> dict[str, int]:
+    # locked defaults (v0.1)
+    max_files = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_FILES", "120"))
+    max_total_chars = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_TOTAL_CHARS", "250000"))
+
+    # optional per-file cap (1.3): if set, file contents may be truncated per-file
+    # NOTE: if unset -> no per-file truncation
+    max_chars_per_file_raw = os.environ.get("SNAPSHOTTER_PASS2_MAX_CHARS_PER_FILE", "").strip()
+    max_chars_per_file = int(max_chars_per_file_raw) if max_chars_per_file_raw else 0
+
+    caps: dict[str, int] = {"max_files": max_files, "max_total_chars": max_total_chars}
+    if max_chars_per_file > 0:
+        caps["max_chars_per_file"] = max_chars_per_file
+    return caps
+
+
+def _extract_candidate_paths(repo_index: dict[str, Any]) -> list[str]:
+    """
+    Extract Pass 1 read_plan_suggestions.candidates paths (order preserved, may include duplicates).
+    """
+    sugg = repo_index.get("read_plan_suggestions", {}) or {}
+    cands = sugg.get("candidates", []) or []
+    cand_paths: list[str] = []
+    for c in cands:
+        if not isinstance(c, dict):
+            continue
+        p = c.get("path")
+        if isinstance(p, str) and p:
+            cand_paths.append(p)
+    return cand_paths
+
+
+def _deterministic_read_plan(repo_index: dict[str, Any], *, max_files: int) -> tuple[list[str], dict[str, Any]]:
+    """
+    Deterministic fallback:
+    - Prefer Pass 1 read_plan_suggestions.candidates (order preserved).
+    - If candidates are fewer than max_files, "top off" using remaining included paths (lexicographic),
+      excluding duplicates, until max_files reached.
+    Returns (plan, debug) where debug explains which source bounded the result.
+    """
+    cand_paths = _extract_candidate_paths(repo_index)
+
+    # de-dupe candidates while preserving order (candidates are already deterministic)
+    plan: list[str] = list(dict.fromkeys(cand_paths))
+
+    included = _repo_index_included_paths(repo_index)  # already sorted
+    included_set = set(included)
+
+    # (optional sanity) keep only those that exist in repo_index included list
+    # This prevents stale candidates from prior runs.
+    before_filter = len(plan)
+    plan = [p for p in plan if p in included_set]
+    filtered_out = before_filter - len(plan)
+
+    used_topoff = False
+    if len(plan) < max_files:
+        used_topoff = True
+        seen = set(plan)
+        for p in included:
+            if p in seen:
+                continue
+            plan.append(p)
+            seen.add(p)
+            if len(plan) >= max_files:
+                break
+
+    final = plan[:max_files]
+
+    debug: dict[str, Any] = {
+        "max_files": max_files,
+        "candidates_len_raw": len(cand_paths),
+        "candidates_len_deduped": len(dict.fromkeys(cand_paths)),
+        "candidates_filtered_out_not_in_repo": filtered_out,
+        "included_len": len(included),
+        "used_topoff": used_topoff,
+        "final_plan_len": len(final),
+        "bounded_by": (
+            "candidates_only"
+            if (len(dict.fromkeys(cand_paths)) > 0 and not used_topoff and len(final) < max_files)
+            else ("max_files_cap" if len(final) >= max_files else "included_exhausted")
+        ),
+    }
+    return final, debug
+
+
+def _llm_read_plan_stub(repo_index: dict[str, Any], *, max_files: int) -> tuple[list[str], list[str], dict[str, Any]]:
+    """
+    Stub for v0.1: no LLM call yet.
+    Returns (selected_paths, requested_missing_paths, debug).
+    """
+    plan, debug = _deterministic_read_plan(repo_index, max_files=max_files)
+    return plan, [], debug
+
+
+def _stream_read_utf8_with_replacement(path: Path, *, max_chars: int) -> tuple[str, bool]:
+    """
+    Stream read file as UTF-8 with replacement, up to max_chars characters.
+    Returns (text, hit_limit) where hit_limit means we read >= max_chars chars (i.e. file may be longer).
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    chunks: list[str] = []
+    total = 0
+    hit_limit = False
+
+    with path.open("rb") as f:
+        while True:
+            b = f.read(8192)
+            if not b:
+                break
+            s = decoder.decode(b)
+            if not s:
+                continue
+            chunks.append(s)
+            total += len(s)
+
+            if total >= max_chars:
+                # trim to exactly max_chars
+                overflow = total - max_chars
+                if overflow > 0:
+                    chunks[-1] = chunks[-1][:-overflow]
+                hit_limit = True
+                break
+
+        # if we did NOT hit limit, flush remaining decoder buffer
+        if not hit_limit:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                chunks.append(tail)
+
+    return "".join(chunks), hit_limit
+
+
 def _build_architecture_summary_snapshot_stub(
     *,
     repo_url: str,
@@ -144,61 +297,80 @@ def _build_architecture_summary_snapshot_stub(
     read_plan_missing: list[str],
     pass2_caps: dict[str, int],
     read_plan_source: str,
+    files_read: list[dict[str, Any]],
+    not_read_reasons: dict[str, str],
+    read_plan_debug: dict[str, Any] | None = None,
+    pass2_total_chars: int | None = None,
 ) -> dict[str, Any]:
     files_scanned = int(repo_index.get("counts", {}).get("files_scanned", 0))
     files_included = int(repo_index.get("counts", {}).get("files_included", 0))
 
-    included_paths = [f.get("path") for f in repo_index.get("files", []) if f.get("path")]
+    included_paths = [f.get("path") for f in repo_index.get("files", []) if isinstance(f, dict) and f.get("path")]
+    included_paths = [p for p in included_paths if isinstance(p, str) and p]
     included_paths.sort()
 
-    # ---- uncertainties (base + missing-files entry) ----
-    uncertainties: list[dict[str, Any]] = [
-        {
-            "type": "incomplete_extraction",
-            "description": "Pass 2 semantic analysis not implemented yet (stub output).",
-            "files_involved": [],
-            "suggested_questions": [
-                "Which files should be prioritized for onboarding (README, entrypoints, core modules)?"
-            ],
-        }
-    ]
-    if read_plan_missing:
-        uncertainties.append(
-            {
-                "type": "read_plan_missing_files",
-                "description": "Planner requested files not present in Pass 1 repo_index.",
-                "files_involved": read_plan_missing,
-                "suggested_questions": [],
-            }
-        )
+    read_paths = [it.get("path") for it in files_read if isinstance(it, dict) and isinstance(it.get("path"), str)]
+    read_set = set(read_paths)
+    plan_set = set([p for p in read_plan_selected if isinstance(p, str)])
 
-    # ---- files_not_read (included-but-not-read + missing-not-in-index) ----
-    files_not_read: list[dict[str, str]] = [{"path": p, "reason": "pass2_not_run"} for p in included_paths]
-    files_not_read.extend({"path": p, "reason": "not_in_repo_index"} for p in read_plan_missing)
+    files_not_read: list[dict[str, Any]] = []
+    for p in included_paths:
+        if p in read_set:
+            continue
+        reason = not_read_reasons.get(p)
+        if not reason:
+            # anything included but not selected by the read plan is still "not read"
+            if p not in plan_set:
+                reason = "not_in_read_plan"
+            else:
+                # selected but not read and no explicit reason recorded (should be rare)
+                reason = "unknown_not_read"
+        files_not_read.append({"path": p, "reason": reason})
 
-    return {
+    # coverage must reflect reality
+    files_read_count = len(read_paths)
+    files_not_read_count = len(files_not_read)
+
+    # guardrail: if pass1 counts disagree, still report the actual list-derived numbers
+    out: dict[str, Any] = {
         "generated_at": utc_ts(),
         "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit or "unknown", "job_id": job_id},
-
-        # NEW: top-level read plan record (locked behavior for Sprint 1.2)
         "read_plan": {
-            "selected_paths": read_plan_selected,  # preserve deterministic order from planner
-            "missing_paths": read_plan_missing,  # deterministic (sorted upstream)
-            "caps": pass2_caps,  # {max_files, max_total_chars}
-            "source": read_plan_source,  # e.g. "llm_stub" for now
+            "selected_paths": read_plan_selected,
+            "missing_paths": read_plan_missing,
+            "caps": pass2_caps,
+            "source": read_plan_source,
         },
-
-        # Keep prior coverage shape (pre-sprint continuity)
         "coverage": {
             "files_scanned": files_scanned,
-            "files_read": 0,
-            "files_not_read": files_included,
+            "files_read": files_read_count,
+            "files_not_read": files_not_read_count,
+            "files_included_from_pass1": files_included,
         },
         "modules": [],
-        "uncertainties": uncertainties,
-        "files_read": [],
+        "uncertainties": [
+            {
+                "type": "incomplete_extraction",
+                "description": "Pass 2 semantic analysis not implemented yet (content fetch now implemented).",
+                "files_involved": [],
+                "suggested_questions": [
+                    "Which files should be prioritized for onboarding (README, entrypoints, core modules)?"
+                ],
+            }
+        ],
+        # now populated by pass2_fetch_files
+        "files_read": files_read,
         "files_not_read": files_not_read,
     }
+
+    # Debug breadcrumb: why the plan length is what it is, and what bounded reading.
+    if read_plan_debug is not None:
+        out["read_plan_debug"] = read_plan_debug
+
+    if pass2_total_chars is not None:
+        out["pass2_total_chars"] = int(pass2_total_chars)
+
+    return out
 
 
 def _build_gaps_and_inconsistencies_stub(*, job_id: str) -> dict[str, Any]:
@@ -271,62 +443,6 @@ def node_pass1_build_index(state: SnapshotterState) -> SnapshotterState:
         raise SnapshotterStageError(stage, e) from e
 
 
-def _pass2_defaults_from_env() -> dict[str, int]:
-    # locked defaults (v0.1)
-    max_files = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_FILES", "120"))
-    max_total_chars = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_TOTAL_CHARS", "250000"))
-    return {"max_files": max_files, "max_total_chars": max_total_chars}
-
-
-def _repo_index_included_paths(repo_index: dict[str, Any]) -> list[str]:
-    files = repo_index.get("files", []) or []
-    out: list[str] = []
-    for f in files:
-        if not isinstance(f, dict):
-            continue
-        p = f.get("path")
-        if isinstance(p, str) and p:
-            out.append(p)
-    return sorted(out)
-
-
-def _deterministic_read_plan(repo_index: dict[str, Any], *, max_files: int) -> list[str]:
-    """
-    Deterministic fallback using Pass 1 read_plan_suggestions.candidates if present,
-    else first N included paths in lexicographic order.
-    """
-    sugg = repo_index.get("read_plan_suggestions", {}) or {}
-    cands = sugg.get("candidates", []) or []
-
-    cand_paths: list[str] = []
-    for c in cands:
-        if not isinstance(c, dict):
-            continue
-        p = c.get("path")
-        if isinstance(p, str) and p:
-            cand_paths.append(p)
-
-    # de-dupe while preserving order (candidates are already deterministic)
-    deduped: list[str] = list(dict.fromkeys(cand_paths))
-
-    if deduped:
-        return deduped[:max_files]
-
-    included = _repo_index_included_paths(repo_index)
-    return included[:max_files]
-
-
-def _llm_read_plan_stub(repo_index: dict[str, Any], *, max_files: int) -> tuple[list[str], list[str]]:
-    """
-    Stub for v0.1: no LLM call yet.
-    Returns (selected_paths, requested_missing_paths).
-
-    Replace later with real LLM logic, but keep the return shape.
-    """
-    plan = _deterministic_read_plan(repo_index, max_files=max_files)
-    return plan, []
-
-
 def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
     stage = STAGE_PASS2_MAKE_READ_PLAN
     try:
@@ -336,7 +452,7 @@ def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
         included_paths = _repo_index_included_paths(repo_index)
         included_set = set(included_paths)
 
-        selected, requested_missing = _llm_read_plan_stub(repo_index, max_files=caps["max_files"])
+        selected, requested_missing, plan_debug = _llm_read_plan_stub(repo_index, max_files=caps["max_files"])
 
         # hard gate: only paths in repo_index
         selected_in_repo = [p for p in selected if isinstance(p, str) and p in included_set]
@@ -351,7 +467,7 @@ def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
                 missing_set.add(p)
         missing = sorted(missing_set)
 
-        # enforce max_files cap
+        # enforce max_files cap (should already be true, but keep as a hard guard)
         selected_in_repo = selected_in_repo[: caps["max_files"]]
 
         # deterministic de-dupe while preserving order
@@ -363,21 +479,99 @@ def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
             seen.add(p)
             final_plan.append(p)
 
+        # add final-plan length info
+        plan_debug = dict(plan_debug or {})
+        plan_debug["final_plan_len_after_repo_gate"] = len(final_plan)
+        plan_debug["caps_max_files"] = int(caps.get("max_files", 0))
+
         state["stage"] = stage
         state["read_plan"] = final_plan
         state["pass2_caps"] = caps
-        state["read_plan_missing"] = missing  # used by 1.3/1.4 to mark not_in_repo_index
+        state["read_plan_missing"] = missing
+        state["pass2_read_plan_debug"] = plan_debug
         return state
     except Exception as e:
         raise SnapshotterStageError(stage, e) from e
 
 
 def node_pass2_fetch_files(state: SnapshotterState) -> SnapshotterState:
+    """
+    Pass 2 fetch worker (1.3):
+    - reads only selected read_plan paths from local repo clone
+    - UTF-8 decode with replacement
+    - enforces total char cap across all fetched files
+    - optional per-file char cap (truncate per-file)
+    - records files_not_read reasons for selected paths that aren't read
+    """
     stage = STAGE_PASS2_FETCH_FILES
     try:
-        # 1.3 will implement bounded fetch; keep placeholder contract for now
+        repo_dir = Path(state["repo_dir"])
+        caps = state.get("pass2_caps", _pass2_defaults_from_env())
+        max_total = int(caps.get("max_total_chars", 250000))
+        max_per_file = int(caps.get("max_chars_per_file", 0))  # optional; 0 => disabled
+
+        total_chars = 0
+        contents: dict[str, str] = {}
+        files_read: list[dict[str, Any]] = []
+        not_read_reasons: dict[str, str] = {}
+
+        plan = state.get("read_plan", [])
+
+        for rel in plan:
+            if not isinstance(rel, str) or not rel:
+                continue
+
+            remaining = max_total - total_chars
+            if remaining <= 0:
+                not_read_reasons[rel] = "exceeds_total_char_cap"
+                continue
+
+            fp = repo_dir / rel
+            if not fp.exists():
+                not_read_reasons[rel] = "missing_on_disk"
+                continue
+
+            try:
+                # Case A: per-file cap active AND it fits in remaining budget => allow truncation
+                if max_per_file > 0 and max_per_file <= remaining:
+                    # read up to max_per_file+1 to detect "longer than cap"
+                    text, hit = _stream_read_utf8_with_replacement(fp, max_chars=max_per_file + 1)
+                    longer_than_cap = hit or (len(text) > max_per_file)
+                    if longer_than_cap:
+                        text = text[:max_per_file]
+                    n = len(text)
+
+                    # should always fit by construction
+                    if n > remaining:
+                        not_read_reasons[rel] = "exceeds_total_char_cap"
+                        continue
+
+                    contents[rel] = text
+                    total_chars += n
+                    files_read.append({"path": rel, "chars": n, "truncated": bool(longer_than_cap)})
+                    continue
+
+                # Case B: must fit fully in remaining budget (no truncation allowed by total-cap rules)
+                text, hit = _stream_read_utf8_with_replacement(fp, max_chars=remaining + 1)
+                too_big = hit or (len(text) > remaining)
+                if too_big:
+                    not_read_reasons[rel] = "exceeds_total_char_cap"
+                    continue
+
+                n = len(text)
+                contents[rel] = text
+                total_chars += n
+                files_read.append({"path": rel, "chars": n, "truncated": False})
+
+            except Exception:
+                not_read_reasons[rel] = "decode_issues"
+                continue
+
         state["stage"] = stage
-        state["file_contents_map"] = {}
+        state["file_contents_map"] = contents
+        state["pass2_total_chars"] = total_chars
+        state["pass2_files_read"] = files_read
+        state["pass2_not_read_reasons"] = not_read_reasons
         return state
     except Exception as e:
         raise SnapshotterStageError(stage, e) from e
@@ -402,6 +596,10 @@ def node_pass2_generate_outputs(state: SnapshotterState) -> SnapshotterState:
                 read_plan_missing=state.get("read_plan_missing", []),
                 pass2_caps=state.get("pass2_caps", _pass2_defaults_from_env()),
                 read_plan_source="llm_stub",
+                files_read=state.get("pass2_files_read", []),
+                not_read_reasons=state.get("pass2_not_read_reasons", {}),
+                read_plan_debug=state.get("pass2_read_plan_debug"),
+                pass2_total_chars=state.get("pass2_total_chars", 0),
             ),
         )
 
