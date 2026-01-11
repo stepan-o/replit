@@ -56,7 +56,8 @@ def _int_from_env(name: str, default: int) -> int:
 def _semantic_caps_from_env() -> SemanticCaps:
     onboarding_enabled = _bool_from_env("SNAPSHOTTER_PASS2_ONBOARDING", True)
     model = os.environ.get("SNAPSHOTTER_LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
-    max_output_tokens = _int_from_env("SNAPSHOTTER_LLM_MAX_OUTPUT_TOKENS", 4000)
+    # Lower default: we are no longer asking the model to emit dependency/evidence appendices.
+    max_output_tokens = _int_from_env("SNAPSHOTTER_LLM_MAX_OUTPUT_TOKENS", 2000)
 
     max_arch_input_chars = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_INPUT_CHARS", 240_000)
     max_arch_files = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_FILES", 120)
@@ -70,6 +71,11 @@ def _semantic_caps_from_env() -> SemanticCaps:
         max_arch_files=max_arch_files,
         max_arch_chars_per_file=max_arch_chars_per_file,
     )
+
+
+# -------------------------------------------------------------------
+# OpenAI Responses API (JSON-only)
+# -------------------------------------------------------------------
 
 
 def _extract_text_from_responses_obj(resp: Any) -> str:
@@ -302,58 +308,18 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
 
 
 # -------------------------------------------------------------------
-# Option B: read Pass1 raw + resolved imports
+# Pass1 -> deterministic facts (deps/env/signals)
 # -------------------------------------------------------------------
 
-def _extract_pass1_import_edges(repo_index: dict[str, Any]) -> dict[str, dict[str, set[str]]]:
-    """
-    Returns:
-      { file_path: { "raw": set[str], "resolved_internal": set[str], "external": set[str] } }
-    """
-    edges: dict[str, dict[str, set[str]]] = {}
-    files = repo_index.get("files", []) or []
-    for f in files:
-        if not isinstance(f, dict):
-            continue
-        path = f.get("path")
-        if not isinstance(path, str) or not path:
-            continue
 
-        raw_set: set[str] = set()
-        internal_set: set[str] = set()
-        external_set: set[str] = set()
-
-        # Compatibility: old "imports" list
-        imp = f.get("imports")
-        if isinstance(imp, list):
-            for x in imp:
-                if isinstance(x, str) and x.strip():
-                    raw_set.add(x.strip())
-
-        # New: imports_raw
-        imp_raw = f.get("imports_raw")
-        if isinstance(imp_raw, list):
-            for x in imp_raw:
-                if isinstance(x, str) and x.strip():
-                    raw_set.add(x.strip())
-
-        # New: resolved internal + external
-        imp_int = f.get("imports_resolved_internal")
-        if isinstance(imp_int, list):
-            for x in imp_int:
-                if isinstance(x, str) and x.strip():
-                    internal_set.add(x.strip())
-
-        imp_ext = f.get("imports_external")
-        if isinstance(imp_ext, list):
-            for x in imp_ext:
-                if isinstance(x, str) and x.strip():
-                    external_set.add(x.strip())
-
-        if raw_set or internal_set or external_set:
-            edges[path] = {"raw": raw_set, "resolved_internal": internal_set, "external": external_set}
-
-    return edges
+def _repo_paths_set(repo_index: dict[str, Any]) -> set[str]:
+    s: set[str] = set()
+    for f in repo_index.get("files", []) or []:
+        if isinstance(f, dict):
+            p = f.get("path")
+            if isinstance(p, str) and p:
+                s.add(p)
+    return s
 
 
 def _language_by_path_from_repo_index(repo_index: dict[str, Any]) -> dict[str, str]:
@@ -368,14 +334,106 @@ def _language_by_path_from_repo_index(repo_index: dict[str, Any]) -> dict[str, s
     return out
 
 
-def _repo_paths_set(repo_index: dict[str, Any]) -> set[str]:
-    s: set[str] = set()
-    for f in repo_index.get("files", []) or []:
-        if isinstance(f, dict):
-            p = f.get("path")
-            if isinstance(p, str) and p:
-                s.add(p)
-    return s
+def _signals_from_repo_index(repo_index: dict[str, Any]) -> dict[str, Any]:
+    sig = repo_index.get("signals", {})
+    return sig if isinstance(sig, dict) else {}
+
+
+def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """
+    Canonical extraction based on Pass1 v2 schema:
+      file["deps"] + file["import_edges"].
+    Output per file:
+      {
+        "resolved_internal": set[str],
+        "external_specs": set[str],
+        "import_edges": list[dict],
+        "flags": set[str],
+        "language": str|None,
+        "top_level_defs": list[str],
+      }
+    """
+    out: dict[str, dict[str, Any]] = {}
+    files = repo_index.get("files", []) or []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        path = f.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+
+        resolved_internal: set[str] = set()
+        external_specs: set[str] = set()
+        import_edges: list[dict[str, Any]] = []
+        flags_set: set[str] = set()
+
+        deps = f.get("deps")
+        if isinstance(deps, dict):
+            internal = deps.get("internal")
+            external = deps.get("external")
+            edges = deps.get("import_edges")
+            if isinstance(internal, list):
+                for x in internal:
+                    if isinstance(x, str) and x.strip():
+                        resolved_internal.add(x.strip())
+            if isinstance(external, list):
+                for x in external:
+                    if isinstance(x, str) and x.strip():
+                        external_specs.add(x.strip())
+            if isinstance(edges, list):
+                for e in edges:
+                    if isinstance(e, dict):
+                        import_edges.append(dict(e))
+
+        if not import_edges:
+            edges2 = f.get("import_edges")
+            if isinstance(edges2, list):
+                for e in edges2:
+                    if isinstance(e, dict):
+                        import_edges.append(dict(e))
+
+        # Fallback old fields if needed
+        if not resolved_internal:
+            v = f.get("imports_resolved_internal")
+            if isinstance(v, list):
+                for x in v:
+                    if isinstance(x, str) and x.strip():
+                        resolved_internal.add(x.strip())
+
+        if not external_specs:
+            v = f.get("imports_external")
+            if isinstance(v, list):
+                for x in v:
+                    if isinstance(x, str) and x.strip():
+                        external_specs.add(x.strip())
+
+        fl = f.get("flags")
+        if isinstance(fl, list):
+            for x in fl:
+                if isinstance(x, str) and x.strip():
+                    flags_set.add(x.strip())
+
+        lang = f.get("language") if isinstance(f.get("language"), str) else None
+        tdefs = f.get("top_level_defs")
+        top_defs: list[str] = []
+        if isinstance(tdefs, list):
+            top_defs = [x for x in tdefs if isinstance(x, str) and x.strip()]
+
+        out[path] = {
+            "resolved_internal": resolved_internal,
+            "external_specs": external_specs,
+            "import_edges": import_edges,
+            "flags": flags_set,
+            "language": lang,
+            "top_level_defs": top_defs,
+        }
+
+    return out
+
+
+# -------------------------------------------------------------------
+# File selection (architecture + onboarding)
+# -------------------------------------------------------------------
 
 
 def _truncate_with_tail(text: str, max_chars: int) -> str:
@@ -397,55 +455,78 @@ def _select_files_for_architecture(
     caps: SemanticCaps,
 ) -> dict[str, str]:
     lang_by_path = _language_by_path_from_repo_index(repo_index)
+    sig = _signals_from_repo_index(repo_index)
+
+    entrypoints: set[str] = set()
+    ep = sig.get("entrypoints")
+    if isinstance(ep, list):
+        for it in ep:
+            if isinstance(it, dict):
+                p = it.get("path")
+                if isinstance(p, str) and p:
+                    entrypoints.add(p)
+
     keys = sorted(file_contents_map.keys())
 
     def score(p: str) -> int:
         pl = p.lower()
         s = 0
 
-        if pl in ("backend/main.py", "frontend/middleware.ts", "frontend/middleware.js"):
-            s += 600
-        if pl in ("frontend/app/layout.tsx", "frontend/app/layout.ts"):
-            s += 560
+        # highest priority: discovered entrypoints
+        if p in entrypoints:
+            s += 1000
+        if pl.endswith(("main.py", "app.py", "server.py")):
+            s += 220
+        if pl.endswith(("/route.ts", "/route.js", "/page.tsx", "/layout.tsx")):
+            s += 220
 
+        # known “spines”
+        if pl in ("backend/main.py", "frontend/middleware.ts", "frontend/middleware.js"):
+            s += 700
+        if pl in ("frontend/app/layout.tsx", "frontend/app/layout.ts"):
+            s += 620
+
+        # backend clusters
         if pl.startswith("backend/routers/"):
-            s += 420
+            s += 480
         if pl in ("backend/security.py", "backend/models.py", "backend/db.py", "backend/config.py"):
-            s += 380
+            s += 420
         if pl.startswith("backend/migrations/"):
-            s += 180
+            s += 190
         if pl.startswith("backend/scripts/"):
             s += 140
 
+        # frontend clusters
         if "/app/api/" in pl and pl.endswith(("/route.ts", "/route.js")):
-            s += 360
+            s += 420
         if "/app/" in pl and pl.endswith("/layout.tsx"):
-            s += 320
+            s += 360
         if "/app/" in pl and pl.endswith("/page.tsx"):
-            s += 260
+            s += 300
         if pl.startswith("frontend/lib/"):
-            s += 240
+            s += 260
         if pl.startswith("frontend/components/"):
-            s += 180
+            s += 200
 
-        if "pinterestpotential" in pl or "pinterest-potential" in pl:
+        # docs + project metadata
+        if pl.endswith("readme.md") or pl == "readme.md":
+            s += 320
+        if pl.startswith("docs/"):
+            s += 260
+        if pl.endswith(".md"):
             s += 120
 
-        if pl.endswith("readme.md") or pl == "readme.md":
-            s += 260
-        if pl.startswith("docs/"):
-            s += 220
-        if pl.endswith(".md"):
-            s += 110
-
+        # runtime/config files
         if pl.endswith(("pyproject.toml", "alembic.ini", "package.json", "next.config.ts", "next.config.js")):
-            s += 170
-        if "eslint" in pl or pl.endswith(("makefile", "uv.lock", "package-lock.json", "tsconfig.json")):
-            s += 100
+            s += 220
+        if "eslint" in pl or pl.endswith(("makefile", "uv.lock", "package-lock.json", "tsconfig.json", "jsconfig.json")):
+            s += 120
+        if pl.endswith((".env.example", ".env", "dockerfile", "docker-compose.yml", "docker-compose.yaml")):
+            s += 140
 
         lang = lang_by_path.get(p, "")
         if lang in ("python", "typescript", "javascript"):
-            s += 10
+            s += 15
 
         return s
 
@@ -476,6 +557,7 @@ def _select_files_for_architecture(
         out[p] = c2
         total += len(c2)
 
+    # floor: ensure we have enough breadth to summarize architecture
     if len(out) < 12:
         for p in keys:
             if len(out) >= min(24, caps.max_arch_files):
@@ -497,71 +579,6 @@ def _select_files_for_architecture(
     return out
 
 
-def _build_architecture_payload(
-    *,
-    repo_url: str,
-    resolved_commit: str,
-    job_id: str,
-    repo_index: dict[str, Any],
-    file_contents_map: dict[str, str],
-    caps: SemanticCaps,
-) -> dict[str, Any]:
-    pass1_imports = _extract_pass1_import_edges(repo_index)
-
-    arch_files = _select_files_for_architecture(file_contents_map=file_contents_map, repo_index=repo_index, caps=caps)
-    files_pack: list[dict[str, Any]] = [{"path": p, "content": c} for p, c in arch_files.items()]
-
-    # Compact imports view for LLM: keep BOTH raw and resolved.
-    pass1_view = {
-        k: {
-            "raw": sorted(list(v.get("raw", set()))),
-            "resolved_internal": sorted(list(v.get("resolved_internal", set()))),
-            "external": sorted(list(v.get("external", set()))),
-        }
-        for k, v in pass1_imports.items()
-    }
-
-    return {
-        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
-        "rules": {
-            "grounding": "Responsibilities must be backed by evidence_paths. If unsure, use 'unknown' and add an uncertainty.",
-            "dependencies": (
-                "Dependencies should reconcile with pass1.imports_by_file for the cited evidence_paths. "
-                "Prefer literal module specifiers. If you use alias forms (e.g. @/...), they must map to the same internal file as a resolved import."
-            ),
-            "evidence_paths_constraint": "Every module evidence_paths MUST be a subset of pass2.files[].path.",
-            "no_deterministic_fields": "Do NOT output read_plan, coverage, files_read, files_not_read; those are injected by the pipeline.",
-        },
-        "pass1": {
-            "counts": repo_index.get("counts", {}),
-            "path_aliases": repo_index.get("path_aliases", {}),
-            "imports_by_file": pass1_view,
-        },
-        "pass2": {"files": files_pack},
-        "output_contract": {
-            "return_json_object_with_keys": ["modules", "uncertainties"],
-            "modules_require": ["name", "type", "responsibilities", "dependencies", "evidence_paths"],
-        },
-    }
-
-
-def _architecture_prompt_text(payload: dict[str, Any]) -> str:
-    return (
-        "Generate Pass 2 architecture semantics for this repo snapshot.\n"
-        "Return ONLY a single JSON object (no markdown) with keys:\n"
-        "  - modules: array of module objects\n"
-        "  - uncertainties: array\n\n"
-        "Hard requirements:\n"
-        "1) Each module MUST include evidence_paths and they MUST be a subset of pass2.files[].path.\n"
-        "2) Responsibilities MUST be grounded in evidence_paths; otherwise set responsibilities=['unknown'] and add an uncertainty.\n"
-        "3) Dependencies MUST reconcile with pass1.imports_by_file based on evidence_paths. "
-        "If you name a dependency as an alias path, it must map to the same internal file as a resolved import.\n"
-        "4) Keep output concise. Do NOT include read_plan/coverage/files_read/files_not_read.\n\n"
-        "INPUT PAYLOAD (JSON):\n"
-        + json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    )
-
-
 def _select_supporting_files_for_gaps_and_onboarding(
     file_contents_map: dict[str, str], *, max_files: int = 28, max_total_chars: int = 120_000
 ) -> dict[str, str]:
@@ -571,21 +588,23 @@ def _select_supporting_files_for_gaps_and_onboarding(
         p_low = p.lower()
         s = 0
         if p_low.endswith("readme.md") or p_low == "readme.md":
-            s += 200
+            s += 220
         if p_low.startswith("docs/") or "/docs/" in p_low:
-            s += 160
+            s += 180
         if p_low.endswith(".md"):
-            s += 120
+            s += 140
         if p_low.endswith(("pyproject.toml", "alembic.ini")):
-            s += 110
+            s += 130
         if p_low.endswith(("makefile", "uv.lock")):
-            s += 90
+            s += 110
         if "next.config" in p_low or "eslint" in p_low:
-            s += 80
+            s += 100
         if p_low.endswith(("backend/main.py", "backend/config.py", "backend/security.py")):
-            s += 75
+            s += 85
         if p_low.endswith(("frontend/app/layout.tsx", "frontend/middleware.ts")):
-            s += 70
+            s += 80
+        if p_low.endswith(("package.json", "tsconfig.json", "jsconfig.json")):
+            s += 75
         if p_low.endswith((".ts", ".tsx")):
             s += 10
         if p_low.endswith((".py",)):
@@ -613,6 +632,89 @@ def _select_supporting_files_for_gaps_and_onboarding(
     return out
 
 
+# -------------------------------------------------------------------
+# Prompt payloads (LLM output is SMALL: modules + anchor_paths + short semantics)
+# -------------------------------------------------------------------
+
+
+def _build_architecture_payload(
+    *,
+    repo_url: str,
+    resolved_commit: str,
+    job_id: str,
+    repo_index: dict[str, Any],
+    file_contents_map: dict[str, str],
+    caps: SemanticCaps,
+) -> dict[str, Any]:
+    arch_files = _select_files_for_architecture(file_contents_map=file_contents_map, repo_index=repo_index, caps=caps)
+    files_pack: list[dict[str, Any]] = [{"path": p, "content": c} for p, c in arch_files.items()]
+
+    # signals are useful, cheap, and deterministic
+    signals = _signals_from_repo_index(repo_index)
+    path_aliases = repo_index.get("path_aliases", {})
+    if not isinstance(path_aliases, dict):
+        path_aliases = {}
+
+    # Keep pass1 counts/signals only; do NOT inject deps_by_file into the prompt.
+    return {
+        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
+        "rules": {
+            "grounding": (
+                "Your statements MUST be grounded in the anchor_paths you cite. "
+                "If unsure, set responsibilities=['unknown'] and add an uncertainty with questions."
+            ),
+            "anchor_paths_constraint": "Every module anchor_paths MUST be a subset of pass2.files[].path.",
+            "no_appendices": (
+                "Do NOT output dependency lists, file inventories, read plans, or audit appendices. "
+                "This pass is semantic: boundaries, runtime entrypoints, key flows."
+            ),
+        },
+        "pass1": {
+            "counts": repo_index.get("counts", {}),
+            "path_aliases": path_aliases,
+            "signals": {
+                "entrypoints": signals.get("entrypoints", []),
+                "env_vars": signals.get("env_vars", []),
+                "package_json": signals.get("package_json", {}),
+            },
+        },
+        "pass2": {"files": files_pack},
+        "output_contract": {
+            "return_json_object_with_keys": ["modules", "uncertainties"],
+            "modules_require": ["name", "type", "summary", "anchor_paths"],
+            "recommended_module_fields": [
+                "responsibilities",
+                "entrypoints",
+                "public_interfaces",
+                "data_flows",
+                "runtime_notes",
+                "where_to_change",
+                "risk_notes",
+            ],
+        },
+    }
+
+
+def _architecture_prompt_text(payload: dict[str, Any]) -> str:
+    return (
+        "Generate Pass 2 architecture semantics for this repo snapshot.\n"
+        "Return ONLY a single JSON object (no markdown) with keys:\n"
+        "  - modules: array of module objects\n"
+        "  - uncertainties: array\n\n"
+        "Hard requirements:\n"
+        "1) Each module MUST include anchor_paths (3–10) and they MUST be a subset of pass2.files[].path.\n"
+        "2) summary must be grounded in anchor_paths. If unsure, set responsibilities=['unknown'] and add an uncertainty.\n"
+        "3) Do NOT output dependency lists, read plans, file inventories, or other appendices.\n"
+        "4) Keep output concise and onboarding-useful: define boundaries, runtime entrypoints, and key flows.\n\n"
+        "Style guidance:\n"
+        "- Prefer ~6–14 modules total.\n"
+        "- Use module.type from: ['frontend','backend','shared_lib','db','jobs','infra','tooling','docs','unknown'].\n"
+        "- anchor_paths should point to representative files, not every file.\n\n"
+        "INPUT PAYLOAD (JSON):\n"
+        + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    )
+
+
 def _build_gaps_onboarding_payload(
     *,
     repo_url: str,
@@ -625,7 +727,6 @@ def _build_gaps_onboarding_payload(
     deterministic_gap_items: list[dict[str, Any]],
     file_contents_map: dict[str, str],
 ) -> dict[str, Any]:
-    pass1_imports = _extract_pass1_import_edges(repo_index)
     support_files = _select_supporting_files_for_gaps_and_onboarding(file_contents_map)
 
     modules_summary: list[dict[str, Any]] = []
@@ -636,30 +737,40 @@ def _build_gaps_onboarding_payload(
             {
                 "name": m.get("name"),
                 "type": m.get("type"),
-                "dependencies": m.get("dependencies", []),
-                "evidence_paths": m.get("evidence_paths", []),
+                "summary": m.get("summary"),
+                "anchor_paths": m.get("anchor_paths", m.get("evidence_paths", [])),
+                "entrypoints": m.get("entrypoints", []),
+                "where_to_change": m.get("where_to_change", []),
+                "risk_notes": m.get("risk_notes", []),
             }
         )
 
-    pass1_view = {
-        k: {
-            "raw": sorted(list(v.get("raw", set()))),
-            "resolved_internal": sorted(list(v.get("resolved_internal", set()))),
-            "external": sorted(list(v.get("external", set()))),
-        }
-        for k, v in pass1_imports.items()
-    }
+    signals = _signals_from_repo_index(repo_index)
+    path_aliases = repo_index.get("path_aliases", {})
+    if not isinstance(path_aliases, dict):
+        path_aliases = {}
+
+    env_vars = signals.get("env_vars", [])
+    pkg = signals.get("package_json", {})
 
     return {
         "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
         "rules": {
             "onboarding_enabled": onboarding_enabled,
             "no_redundant_dumping": "Do NOT restate full code listings. Keep items concise and actionable.",
+            "onboarding_md_goal": (
+                "Write onboarding_md as a practical architect handoff: quickstart, entrypoints, boundaries, "
+                "data/state flow, configuration surface (env vars), and common change locations."
+            ),
         },
         "pass1": {
             "counts": repo_index.get("counts", {}),
-            "path_aliases": repo_index.get("path_aliases", {}),
-            "imports_by_file": pass1_view,
+            "path_aliases": path_aliases,
+            "signals": {
+                "entrypoints": signals.get("entrypoints", []),
+                "env_vars": env_vars,
+                "package_json": pkg,
+            },
         },
         "architecture_summary": {
             "modules": modules_summary,
@@ -686,189 +797,150 @@ def _gaps_onboarding_prompt_text(payload: dict[str, Any]) -> str:
         "2) Do NOT duplicate deterministic gaps already listed in deterministic_gaps_already_found.\n"
         "3) If onboarding_enabled is false, set onboarding_md to an empty string.\n"
         "4) Keep it concise and self-auditing.\n\n"
+        "Onboarding MD requirements (if enabled):\n"
+        "- Must include sections: Overview, Entry points, Configuration (env vars), Common tasks, Where to change code, Risks/footguns.\n"
+        "- Use file paths when referencing code.\n\n"
         "INPUT PAYLOAD (JSON):\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True)
     )
 
 
-def _norm_dep_token(s: str) -> str:
-    return (s or "").strip()
+# -------------------------------------------------------------------
+# Deterministic derivations (NO LLM dependency enforcement)
+# -------------------------------------------------------------------
 
 
-def _candidate_repo_files_for_noext(base: str) -> list[str]:
+def _derive_deps_from_anchor_paths(
+    modules: list[dict[str, Any]],
+    deps_by_file: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
     """
-    For dep tokens like "@/lib/x" (no ext), try common TS/JS resolution patterns.
-    This does NOT touch filesystem; it matches against repo_index paths.
+    Deterministically attach dependencies to modules from pass1 deps_by_file, based on anchor_paths.
+
+    deps = sorted(unique internal repo paths) + sorted(unique external specs)
+
+    Also sets evidence_paths := anchor_paths for downstream compatibility.
     """
-    b = base.rstrip("/")
-    if not b:
-        return []
-    exts = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts", ".json")
-    out: list[str] = []
-    for e in exts:
-        out.append(b + e)
-    for e in exts:
-        out.append(b + "/index" + e)
-    return out
+    for m in modules:
+        anchors = m.get("anchor_paths")
+        if not isinstance(anchors, list):
+            anchors = m.get("evidence_paths")
+        if not isinstance(anchors, list):
+            anchors = []
+        anchors = [p for p in anchors if isinstance(p, str) and p.strip()]
 
-
-def _resolve_dep_token_to_repo_path(
-    dep: str,
-    *,
-    repo_paths: set[str],
-    path_aliases: dict[str, Any],
-) -> str | None:
-    """
-    Resolve a dependency token (usually emitted by LLM) into a canonical repo-relative file path,
-    using Pass1 alias info + repo inventory.
-
-    Supports:
-      - "@/x" via alias rules or fallback to "frontend/x"
-      - "/x" from repo root
-      - "frontend/..." direct
-    """
-    d = (dep or "").strip()
-    if not d:
-        return None
-
-    # If it already looks like a repo path and exists, accept it.
-    if d in repo_paths:
-        return d
-
-    # Strip possible extensions and try suffix-based matching
-    # (We keep this conservative: only do it if it unambiguously matches via candidates below.)
-
-    # Rooted repo path
-    if d.startswith("/"):
-        base = d.lstrip("/")
-        if base in repo_paths:
-            return base
-        if "." in os.path.basename(base):
-            return base if base in repo_paths else None
-        for cand in _candidate_repo_files_for_noext(base):
-            if cand in repo_paths:
-                return cand
-        return None
-
-    # Alias prefixes from pass1.path_aliases
-    alias_prefixes = path_aliases.get("alias_prefixes")
-    if isinstance(alias_prefixes, list):
-        for rule in alias_prefixes:
-            if not isinstance(rule, dict):
+        internal: set[str] = set()
+        external: set[str] = set()
+        for p in anchors:
+            info = deps_by_file.get(p)
+            if not info:
                 continue
-            ap = rule.get("alias_prefix")
-            targets = rule.get("targets")
-            if not isinstance(ap, str) or not ap:
-                continue
-            if not isinstance(targets, list) or not targets:
-                continue
-            if d.startswith(ap):
-                tail = d[len(ap):].lstrip("/")
-                for tp in targets:
-                    if not isinstance(tp, str) or not tp:
-                        continue
-                    base = (tp + tail).replace("\\", "/").lstrip("./")
-                    if base in repo_paths:
-                        return base
-                    if "." in os.path.basename(base):
-                        if base in repo_paths:
-                            return base
-                        continue
-                    for cand in _candidate_repo_files_for_noext(base):
-                        if cand in repo_paths:
-                            return cand
+            internal |= set(info.get("resolved_internal", set()) or [])
+            external |= set(info.get("external_specs", set()) or [])
 
-    # Common Next fallback: "@/..." -> "frontend/..."
-    if d.startswith("@/"):
-        base = ("frontend/" + d[2:].lstrip("/")).replace("\\", "/").lstrip("./")
-        if base in repo_paths:
-            return base
-        if "." in os.path.basename(base):
-            return base if base in repo_paths else None
-        for cand in _candidate_repo_files_for_noext(base):
-            if cand in repo_paths:
-                return cand
-        return None
+        m["anchor_paths"] = anchors
+        m["evidence_paths"] = list(anchors)  # compat
+        m["dependencies"] = sorted(internal) + sorted(external)
 
-    # If it looks like a direct internal path without extension
-    if d.startswith(("frontend/", "backend/")):
-        if d in repo_paths:
-            return d
-        if "." in os.path.basename(d):
-            return d if d in repo_paths else None
-        for cand in _candidate_repo_files_for_noext(d):
-            if cand in repo_paths:
-                return cand
-        return None
-
-    return None
+    return modules
 
 
-def _dep_supported_by_imports(
-    dep: str,
-    *,
-    imports_raw: set[str],
-    imports_resolved_internal: set[str],
-    repo_paths: set[str],
-    path_aliases: dict[str, Any],
-) -> bool:
-    """
-    Option B reconciliation:
-      - accept exact/raw hierarchical matches (old behavior)
-      - OR resolve dep token -> repo path and see if it matches evidence resolved imports
-    """
-    d = _norm_dep_token(dep)
-    if not d:
-        return False
+# -------------------------------------------------------------------
+# Deterministic gap scans (grounded, non-LLM)
+# -------------------------------------------------------------------
 
-    # 1) exact / hierarchical raw match (keeps prior behavior for package deps etc.)
-    if d in imports_raw:
-        return True
-    for imp in imports_raw:
-        if not imp:
+
+def _deterministic_gap_scan(repo_index: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    files = repo_index.get("files", []) or []
+    sig = _signals_from_repo_index(repo_index)
+
+    # (1) unresolved internal imports flagged by pass1
+    unresolved_paths: list[str] = []
+    parse_failed: list[str] = []
+    for f in files:
+        if not isinstance(f, dict):
             continue
-        if "." in d or "." in imp:
-            if imp.startswith(d + ".") or d.startswith(imp + "."):
-                return True
-        if "/" in d or "/" in imp:
-            if imp.startswith(d + "/") or d.startswith(imp + "/"):
-                return True
+        p = f.get("path")
+        flags = f.get("flags")
+        if not isinstance(p, str) or not p:
+            continue
+        if isinstance(flags, list):
+            if "import_unresolved" in flags:
+                unresolved_paths.append(p)
+            if "python_parse_failed" in flags or "js_ts_parse_failed" in flags:
+                parse_failed.append(p)
 
-    # 2) resolved internal path match
-    resolved = _resolve_dep_token_to_repo_path(d, repo_paths=repo_paths, path_aliases=path_aliases)
-    if resolved and resolved in imports_resolved_internal:
-        return True
+    if unresolved_paths:
+        items.append(
+            {
+                "type": "unresolved_internal_imports",
+                "severity": "medium",
+                "description": "Some files contain internal-looking imports that did not resolve to repo paths in pass1.",
+                "files_involved": sorted(unresolved_paths)[:60],
+                "suggested_questions": [
+                    "Are path aliases/baseUrl configured correctly (tsconfig/jsconfig)?",
+                    "Are imports pointing to generated files or omitted extensions not covered by resolver?",
+                ],
+            }
+        )
 
-    # 3) if dep resolved, also allow matching by no-ext stem equality (very common)
-    if resolved:
-        stem = re.sub(r"\.(d\.ts|ts|tsx|js|jsx|mjs|cjs|json)$", "", resolved)
-        for ri in imports_resolved_internal:
-            ri_stem = re.sub(r"\.(d\.ts|ts|tsx|js|jsx|mjs|cjs|json)$", "", ri)
-            if ri_stem == stem:
-                return True
+    if parse_failed:
+        items.append(
+            {
+                "type": "parser_failures",
+                "severity": "low",
+                "description": "Some files could not be parsed cleanly for defs/imports; pass1 fell back to best-effort.",
+                "files_involved": sorted(parse_failed)[:60],
+                "suggested_questions": ["Are these files syntactically valid? Are they templates or partials?"],
+            }
+        )
 
-    return False
+    # (2) missing entrypoint hints
+    eps = sig.get("entrypoints", [])
+    if not isinstance(eps, list) or len(eps) == 0:
+        items.append(
+            {
+                "type": "no_entrypoints_detected",
+                "severity": "low",
+                "description": "Pass1 did not detect any entrypoint hints (Next.js pages/routes, python __main__, FastAPI app, etc.).",
+                "files_involved": [],
+                "suggested_questions": [
+                    "Is the repo structure non-standard (not frontend/backend)?",
+                    "Do we need additional heuristics for your framework conventions?",
+                ],
+            }
+        )
+
+    return items
+
+
+# -------------------------------------------------------------------
+# Post-enforcement (grounding only; deps derived deterministically later)
+# -------------------------------------------------------------------
+
+
+_ALLOWED_TYPES = {"frontend", "backend", "shared_lib", "db", "jobs", "infra", "tooling", "docs", "unknown"}
 
 
 def _post_enforce_architecture_constraints(
     *,
-    modules: list[Any],
-    uncertainties: list[Any],
+    modules: Any,
+    uncertainties: Any,
     allowed_paths: set[str],
-    pass1_imports: dict[str, dict[str, set[str]]],
-    repo_paths: set[str],
-    path_aliases: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     out_modules: list[dict[str, Any]] = []
     out_uncertainties: list[dict[str, Any]] = []
-    deterministic_gap_items: list[dict[str, Any]] = []
 
     if isinstance(uncertainties, list):
         for u in uncertainties:
             if isinstance(u, dict):
                 out_uncertainties.append(u)
 
-    for i, m in enumerate(modules if isinstance(modules, list) else []):
+    if not isinstance(modules, list):
+        modules = []
+
+    for i, m in enumerate(modules):
         if not isinstance(m, dict):
             continue
         mm = dict(m)
@@ -880,26 +952,45 @@ def _post_enforce_architecture_constraints(
         mtype = mm.get("type")
         if not isinstance(mtype, str) or not mtype.strip():
             mm["type"] = "unknown"
+        else:
+            mt = mtype.strip()
+            mm["type"] = mt if mt in _ALLOWED_TYPES else "unknown"
 
-        ev = mm.get("evidence_paths")
-        if not isinstance(ev, list):
-            ev = []
-        ev = [p for p in ev if isinstance(p, str) and p in allowed_paths]
-        mm["evidence_paths"] = ev
+        anchors = mm.get("anchor_paths")
+        if not isinstance(anchors, list):
+            anchors = []
+        anchors = [p for p in anchors if isinstance(p, str) and p in allowed_paths]
 
+        # enforce 3–10 anchor paths if possible
+        if len(anchors) > 10:
+            anchors = anchors[:10]
+        mm["anchor_paths"] = anchors
+
+        # summary (required)
+        summary = mm.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            # salvage from responsibilities if present
+            resp = mm.get("responsibilities")
+            if isinstance(resp, list):
+                resp2 = [r for r in resp if isinstance(r, str) and r.strip()]
+                if resp2:
+                    summary = "; ".join(resp2[:3])
+            mm["summary"] = summary.strip() if isinstance(summary, str) and summary.strip() else "unknown"
+
+        # responsibilities (optional but useful)
         resp = mm.get("responsibilities")
         if not isinstance(resp, list):
             resp = []
         resp = [r for r in resp if isinstance(r, str) and r.strip()]
-
-        if not ev:
+        if not anchors:
             mm["responsibilities"] = ["unknown"]
+            mm["summary"] = "unknown"
             out_uncertainties.append(
                 {
                     "type": "ungrounded_module",
-                    "description": f"Module '{mm.get('name','unknown')}' lacks evidence_paths in files_read; responsibilities set to unknown.",
+                    "description": f"Module '{mm.get('name','unknown')}' lacks anchor_paths in files_read; summary/responsibilities set to unknown.",
                     "files_involved": [],
-                    "suggested_questions": ["Which files define this module's responsibilities? Add them to read_plan."],
+                    "suggested_questions": ["Which files define this module? Add representative files to pass2 selection."],
                 }
             )
         else:
@@ -909,59 +1000,24 @@ def _post_enforce_architecture_constraints(
                     {
                         "type": "empty_responsibilities",
                         "description": f"Module '{mm.get('name','unknown')}' had no responsibilities listed; set to unknown.",
-                        "files_involved": ev,
+                        "files_involved": anchors,
                         "suggested_questions": ["What does this module do? Add explicit responsibilities."],
                     }
                 )
 
-        deps = mm.get("dependencies")
-        if not isinstance(deps, list):
-            deps = []
-        deps = [_norm_dep_token(d) for d in deps if isinstance(d, str) and d.strip()]
-        mm["dependencies"] = deps
-
-        # Dependency mismatch detection (Option B-aware)
-        if deps and ev and pass1_imports:
-            evidence_raw: set[str] = set()
-            evidence_resolved_internal: set[str] = set()
-
-            for p in ev:
-                info = pass1_imports.get(p)
-                if not info:
-                    continue
-                evidence_raw |= info.get("raw", set())
-                evidence_resolved_internal |= info.get("resolved_internal", set())
-
-            # Framework implicit exceptions
-            has_tsx_jsx = any(str(p).lower().endswith((".tsx", ".jsx")) for p in ev)
-            for d in deps:
-                if d == "react" and has_tsx_jsx:
-                    continue
-                if d == "next" and any(imp.startswith("next/") for imp in evidence_raw):
-                    continue
-
-                supported = _dep_supported_by_imports(
-                    d,
-                    imports_raw=evidence_raw,
-                    imports_resolved_internal=evidence_resolved_internal,
-                    repo_paths=repo_paths,
-                    path_aliases=path_aliases,
-                )
-                if not supported:
-                    deterministic_gap_items.append(
-                        {
-                            "type": "dependency_mismatch",
-                            "severity": "warning",
-                            "module": mm.get("name", "unknown"),
-                            "dependency": d,
-                            "evidence_paths": ev,
-                            "description": "Dependency not supported by Pass 1 imports (raw or resolved internal) from the module evidence files.",
-                        }
-                    )
+        # Do NOT accept/require deps from LLM output
+        mm["dependencies"] = []
+        # downstream compat (populated later, but keep field stable)
+        mm["evidence_paths"] = list(anchors)
 
         out_modules.append(mm)
 
-    return out_modules, out_uncertainties, deterministic_gap_items
+    return out_modules, out_uncertainties
+
+
+# -------------------------------------------------------------------
+# Gaps normalization / dedupe
+# -------------------------------------------------------------------
 
 
 def _normalize_gaps_object(gaps: Any, *, job_id: str) -> dict[str, Any]:
@@ -1032,6 +1088,11 @@ def _fix_false_missing_route_gap_items(items: list[dict[str, Any]], allowed_path
     return out
 
 
+# -------------------------------------------------------------------
+# Public API
+# -------------------------------------------------------------------
+
+
 def generate_pass2_semantic_artifacts(
     *,
     repo_url: str,
@@ -1042,8 +1103,17 @@ def generate_pass2_semantic_artifacts(
     files_not_read: list[dict[str, Any]],
     file_contents_map: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """
+    Drop-in replacement behavior:
+      - Pass2 LLM outputs ONLY: semantic modules + anchor_paths + short text
+      - evidence_paths and dependencies are derived deterministically after the fact
+      - no LLM dependency reconciliation, no dependency_mismatch gap spam
+    """
     caps = _semantic_caps_from_env()
 
+    # -------------------------
+    # Architecture semantics
+    # -------------------------
     arch_payload = _build_architecture_payload(
         repo_url=repo_url,
         resolved_commit=resolved_commit,
@@ -1058,31 +1128,34 @@ def generate_pass2_semantic_artifacts(
         prompt=arch_prompt,
         model=caps.model,
         max_output_tokens=caps.max_output_tokens,
-        system="You are a precise code analyst. Output JSON only.",
+        system="You are a precise code architect. Output JSON only.",
     )
-
-    modules = arch_obj.get("modules", [])
-    uncertainties = arch_obj.get("uncertainties", [])
 
     allowed_paths = set(file_contents_map.keys())
-    pass1_imports = _extract_pass1_import_edges(repo_index)
-    repo_paths = _repo_paths_set(repo_index)
-    path_aliases = repo_index.get("path_aliases", {}) if isinstance(repo_index.get("path_aliases", {}), dict) else {}
 
-    enforced_modules, enforced_uncertainties, deterministic_gap_items = _post_enforce_architecture_constraints(
-        modules=modules,
-        uncertainties=uncertainties,
+    enforced_modules, enforced_uncertainties = _post_enforce_architecture_constraints(
+        modules=arch_obj.get("modules", []),
+        uncertainties=arch_obj.get("uncertainties", []),
         allowed_paths=allowed_paths,
-        pass1_imports=pass1_imports,
-        repo_paths=repo_paths,
-        path_aliases=path_aliases,
     )
+
+    # deterministically attach deps (and evidence_paths := anchor_paths for compat)
+    deps_by_file = _extract_pass1_deps(repo_index)
+    enforced_modules = _derive_deps_from_anchor_paths(enforced_modules, deps_by_file)
 
     arch_out: dict[str, Any] = {
         "modules": enforced_modules,
         "uncertainties": enforced_uncertainties,
     }
 
+    # -------------------------
+    # Deterministic gaps (non-LLM)
+    # -------------------------
+    deterministic_gap_items = _deterministic_gap_scan(repo_index)
+
+    # -------------------------
+    # LLM gaps + onboarding (no deterministic dumping)
+    # -------------------------
     gaps_payload = _build_gaps_onboarding_payload(
         repo_url=repo_url,
         resolved_commit=resolved_commit,
