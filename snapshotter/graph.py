@@ -11,6 +11,7 @@ from typing import Any, Optional, TypedDict
 from snapshotter.git_ops import clone_and_checkout
 from snapshotter.job import Job
 from snapshotter.pass1 import build_repo_index, write_json
+from snapshotter.pass2_semantic import Pass2SemanticError, generate_pass2_semantic_artifacts
 from snapshotter.s3_uploader import S3Uploader
 from snapshotter.utils import sha256_bytes, stable_json_fingerprint_sha256, utc_ts
 from snapshotter.validate_basic import validate_basic_artifacts
@@ -77,8 +78,8 @@ class SnapshotterState(TypedDict, total=False):
 
     # pass2 fetch reporting
     pass2_total_chars: int
-    pass2_files_read: list[dict[str, Any]]           # [{path, chars, truncated}]
-    pass2_not_read_reasons: dict[str, str]           # {path: reason}
+    pass2_files_read: list[dict[str, Any]]  # [{path, chars, truncated}]
+    pass2_not_read_reasons: dict[str, str]  # {path: reason}
 
     # pass2 planning debug (optional)
     pass2_read_plan_debug: dict[str, Any]
@@ -156,12 +157,20 @@ def _repo_index_included_paths(repo_index: dict[str, Any]) -> list[str]:
 
 
 def _pass2_defaults_from_env() -> dict[str, int]:
-    # locked defaults (v0.1)
-    max_files = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_FILES", "120"))
-    max_total_chars = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_TOTAL_CHARS", "250000"))
+    """
+    Pass 2 fetch caps.
 
-    # optional per-file cap (1.3): if set, file contents may be truncated per-file
-    # NOTE: if unset -> no per-file truncation
+    Notes:
+    - We accept both *_CHARS and legacy-ish *_CHAR variants to avoid config typos breaking runs.
+    - max_chars_per_file is optional; 0/absent disables per-file truncation.
+    """
+    max_files = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_FILES", "120"))
+
+    max_total_chars_raw = os.environ.get("SNAPSHOTTER_PASS2_MAX_TOTAL_CHARS", "").strip()
+    if not max_total_chars_raw:
+        max_total_chars_raw = os.environ.get("SNAPSHOTTER_PASS2_MAX_TOTAL_CHAR", "").strip()
+    max_total_chars = int(max_total_chars_raw) if max_total_chars_raw else 250000
+
     max_chars_per_file_raw = os.environ.get("SNAPSHOTTER_PASS2_MAX_CHARS_PER_FILE", "").strip()
     max_chars_per_file = int(max_chars_per_file_raw) if max_chars_per_file_raw else 0
 
@@ -193,18 +202,15 @@ def _deterministic_read_plan(repo_index: dict[str, Any], *, max_files: int) -> t
     - Prefer Pass 1 read_plan_suggestions.candidates (order preserved).
     - If candidates are fewer than max_files, "top off" using remaining included paths (lexicographic),
       excluding duplicates, until max_files reached.
-    Returns (plan, debug) where debug explains which source bounded the result.
+    Returns (plan, debug).
     """
     cand_paths = _extract_candidate_paths(repo_index)
 
-    # de-dupe candidates while preserving order (candidates are already deterministic)
-    plan: list[str] = list(dict.fromkeys(cand_paths))
+    plan: list[str] = list(dict.fromkeys(cand_paths))  # de-dupe while preserving order
 
-    included = _repo_index_included_paths(repo_index)  # already sorted
+    included = _repo_index_included_paths(repo_index)
     included_set = set(included)
 
-    # (optional sanity) keep only those that exist in repo_index included list
-    # This prevents stale candidates from prior runs.
     before_filter = len(plan)
     plan = [p for p in plan if p in included_set]
     filtered_out = before_filter - len(plan)
@@ -242,8 +248,7 @@ def _deterministic_read_plan(repo_index: dict[str, Any], *, max_files: int) -> t
 
 def _llm_read_plan_stub(repo_index: dict[str, Any], *, max_files: int) -> tuple[list[str], list[str], dict[str, Any]]:
     """
-    Stub for v0.1: no LLM call yet.
-    Returns (selected_paths, requested_missing_paths, debug).
+    v0.1 still uses deterministic plan selection; semantic generation happens in pass2_semantic.py.
     """
     plan, debug = _deterministic_read_plan(repo_index, max_files=max_files)
     return plan, [], debug
@@ -271,14 +276,12 @@ def _stream_read_utf8_with_replacement(path: Path, *, max_chars: int) -> tuple[s
             total += len(s)
 
             if total >= max_chars:
-                # trim to exactly max_chars
                 overflow = total - max_chars
                 if overflow > 0:
                     chunks[-1] = chunks[-1][:-overflow]
                 hit_limit = True
                 break
 
-        # if we did NOT hit limit, flush remaining decoder buffer
         if not hit_limit:
             tail = decoder.decode(b"", final=True)
             if tail:
@@ -287,8 +290,46 @@ def _stream_read_utf8_with_replacement(path: Path, *, max_chars: int) -> tuple[s
     return "".join(chunks), hit_limit
 
 
-def _build_architecture_summary_snapshot_stub(
+def _compute_files_not_read(
     *,
+    repo_index: dict[str, Any],
+    files_read: list[dict[str, Any]],
+    read_plan_selected: list[str],
+    not_read_reasons_for_selected: dict[str, str],
+) -> list[dict[str, Any]]:
+    """
+    Build files_not_read across *all included* paths, with explicit reasons:
+    - if file is read => omitted
+    - if selected but not read => use recorded reason or "unknown_not_read"
+    - if included but not selected => "not_in_read_plan"
+    """
+    included_paths = _repo_index_included_paths(repo_index)
+
+    read_paths = [
+        it.get("path")
+        for it in files_read
+        if isinstance(it, dict) and isinstance(it.get("path"), str) and it.get("path")
+    ]
+    read_set = set(read_paths)
+
+    plan_set = {p for p in read_plan_selected if isinstance(p, str) and p}
+
+    out: list[dict[str, Any]] = []
+    for p in included_paths:
+        if p in read_set:
+            continue
+
+        reason = not_read_reasons_for_selected.get(p)
+        if not reason:
+            reason = "not_in_read_plan" if p not in plan_set else "unknown_not_read"
+        out.append({"path": p, "reason": reason})
+
+    return out
+
+
+def _normalize_architecture_snapshot(
+    *,
+    arch: dict[str, Any],
     repo_url: str,
     resolved_commit: str,
     job_id: str,
@@ -297,93 +338,111 @@ def _build_architecture_summary_snapshot_stub(
     read_plan_missing: list[str],
     pass2_caps: dict[str, int],
     read_plan_source: str,
+    read_plan_debug: dict[str, Any] | None,
+    pass2_total_chars: int,
     files_read: list[dict[str, Any]],
-    not_read_reasons: dict[str, str],
-    read_plan_debug: dict[str, Any] | None = None,
-    pass2_total_chars: int | None = None,
+    files_not_read: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    files_scanned = int(repo_index.get("counts", {}).get("files_scanned", 0))
-    files_included = int(repo_index.get("counts", {}).get("files_included", 0))
+    """
+    Force self-auditing + required top-level keys, regardless of LLM drift.
+    Also ensures each module has evidence_paths and responsibilities (unknown if missing).
+    """
+    out = dict(arch or {})
+    out["generated_at"] = utc_ts()
+    out["repo"] = {"repo_url": repo_url, "resolved_commit": resolved_commit or "unknown", "job_id": job_id}
 
-    included_paths = [f.get("path") for f in repo_index.get("files", []) if isinstance(f, dict) and f.get("path")]
-    included_paths = [p for p in included_paths if isinstance(p, str) and p]
-    included_paths.sort()
-
-    read_paths = [it.get("path") for it in files_read if isinstance(it, dict) and isinstance(it.get("path"), str)]
-    read_set = set(read_paths)
-    plan_set = set([p for p in read_plan_selected if isinstance(p, str)])
-
-    files_not_read: list[dict[str, Any]] = []
-    for p in included_paths:
-        if p in read_set:
-            continue
-        reason = not_read_reasons.get(p)
-        if not reason:
-            # anything included but not selected by the read plan is still "not read"
-            if p not in plan_set:
-                reason = "not_in_read_plan"
-            else:
-                # selected but not read and no explicit reason recorded (should be rare)
-                reason = "unknown_not_read"
-        files_not_read.append({"path": p, "reason": reason})
-
-    # coverage must reflect reality
-    files_read_count = len(read_paths)
-    files_not_read_count = len(files_not_read)
-
-    # guardrail: if pass1 counts disagree, still report the actual list-derived numbers
-    out: dict[str, Any] = {
-        "generated_at": utc_ts(),
-        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit or "unknown", "job_id": job_id},
-        "read_plan": {
-            "selected_paths": read_plan_selected,
-            "missing_paths": read_plan_missing,
-            "caps": pass2_caps,
-            "source": read_plan_source,
-        },
-        "coverage": {
-            "files_scanned": files_scanned,
-            "files_read": files_read_count,
-            "files_not_read": files_not_read_count,
-            "files_included_from_pass1": files_included,
-        },
-        "modules": [],
-        "uncertainties": [
-            {
-                "type": "incomplete_extraction",
-                "description": "Pass 2 semantic analysis not implemented yet (content fetch now implemented).",
-                "files_involved": [],
-                "suggested_questions": [
-                    "Which files should be prioritized for onboarding (README, entrypoints, core modules)?"
-                ],
-            }
-        ],
-        # now populated by pass2_fetch_files
-        "files_read": files_read,
-        "files_not_read": files_not_read,
+    out["read_plan"] = {
+        "selected_paths": read_plan_selected,
+        "missing_paths": read_plan_missing,
+        "caps": pass2_caps,
+        "source": read_plan_source,
     }
-
-    # Debug breadcrumb: why the plan length is what it is, and what bounded reading.
     if read_plan_debug is not None:
         out["read_plan_debug"] = read_plan_debug
 
-    if pass2_total_chars is not None:
-        out["pass2_total_chars"] = int(pass2_total_chars)
+    files_scanned = int(repo_index.get("counts", {}).get("files_scanned", 0))
+    files_included = int(repo_index.get("counts", {}).get("files_included", 0))
+
+    # Coverage should reflect actual lists, not promises.
+    out["coverage"] = {
+        "files_scanned": files_scanned,
+        "files_read": len(files_read),
+        "files_not_read": len(files_not_read),
+        "files_included_from_pass1": files_included,
+    }
+    out["pass2_total_chars"] = int(pass2_total_chars)
+
+    # Always include these for self-auditing.
+    out["files_read"] = files_read
+    out["files_not_read"] = files_not_read
+
+    modules = out.get("modules")
+    if not isinstance(modules, list):
+        modules = []
+        out["modules"] = modules
+
+    uncertainties = out.get("uncertainties")
+    if not isinstance(uncertainties, list):
+        uncertainties = []
+        out["uncertainties"] = uncertainties
+
+    # Normalize modules minimally to satisfy contract.
+    for i, m in enumerate(modules):
+        if not isinstance(m, dict):
+            continue
+
+        name = m.get("name")
+        if not isinstance(name, str) or not name.strip():
+            m["name"] = f"unknown_module_{i}"
+
+        mtype = m.get("type")
+        if not isinstance(mtype, str) or not mtype.strip():
+            m["type"] = "unknown"
+
+        ev = m.get("evidence_paths")
+        if not isinstance(ev, list):
+            ev = []
+        # pass2_semantic prunes these already, but keep safe:
+        ev = [p for p in ev if isinstance(p, str) and p]
+        m["evidence_paths"] = ev
+
+        resp = m.get("responsibilities")
+        if not isinstance(resp, list) or not resp:
+            resp = []
+        resp = [r for r in resp if isinstance(r, str) and r.strip()]
+        if not ev:
+            # Hard rule: no evidence => unknown + uncertainty.
+            m["responsibilities"] = ["unknown"]
+            uncertainties.append(
+                {
+                    "type": "ungrounded_module",
+                    "description": f"Module '{m['name']}' lacks evidence_paths in files_read; responsibilities set to unknown.",
+                    "files_involved": [],
+                    "suggested_questions": ["Which files define this module's responsibilities? Add them to read_plan."],
+                }
+            )
+        else:
+            # Evidence exists; still ensure responsibilities are non-empty.
+            if not resp:
+                m["responsibilities"] = ["unknown"]
+                uncertainties.append(
+                    {
+                        "type": "empty_responsibilities",
+                        "description": f"Module '{m['name']}' had no responsibilities listed; set to unknown.",
+                        "files_involved": ev,
+                        "suggested_questions": ["What does this module do? Add explicit responsibilities."],
+                    }
+                )
+            else:
+                m["responsibilities"] = resp
+
+        deps = m.get("dependencies")
+        if not isinstance(deps, list):
+            deps = []
+        deps = [d for d in deps if isinstance(d, str) and d.strip()]
+        m["dependencies"] = deps
 
     return out
-
-
-def _build_gaps_and_inconsistencies_stub(*, job_id: str) -> dict[str, Any]:
-    return {"generated_at": utc_ts(), "job_id": job_id, "items": []}
-
-
-def _build_onboarding_stub(*, repo_url: str, resolved_commit: str) -> str:
-    return (
-        "# Onboarding (stub)\n\n"
-        f"Repo: {repo_url}\n"
-        f"Commit: {resolved_commit}\n\n"
-        "Pass 2 semantic onboarding has not been generated yet.\n"
-    )
 
 
 def node_load_job(state: SnapshotterState) -> SnapshotterState:
@@ -403,6 +462,9 @@ def node_load_job(state: SnapshotterState) -> SnapshotterState:
             "architecture_snapshot": str(Path(out_dir) / "ARCHITECTURE_SUMMARY_SNAPSHOT.json"),
             "gaps": str(Path(out_dir) / "GAPS_AND_INCONSISTENCIES.json"),
             "onboarding": str(Path(out_dir) / "ONBOARDING.md"),
+            # Debug-only: raw LLM output captured on parse failure (not uploaded).
+            "pass2_llm_raw_output": str(Path(out_dir) / "PASS2_LLM_RAW_OUTPUT.txt"),
+            "pass2_llm_repaired_output": str(Path(out_dir) / "PASS2_LLM_REPAIRED_OUTPUT.txt"),
         }
 
         state["stage"] = stage
@@ -454,10 +516,8 @@ def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
 
         selected, requested_missing, plan_debug = _llm_read_plan_stub(repo_index, max_files=caps["max_files"])
 
-        # hard gate: only paths in repo_index
         selected_in_repo = [p for p in selected if isinstance(p, str) and p in included_set]
 
-        # anything requested but not in repo_index -> track
         missing_set = set()
         for p in requested_missing:
             if isinstance(p, str) and p and p not in included_set:
@@ -467,10 +527,8 @@ def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
                 missing_set.add(p)
         missing = sorted(missing_set)
 
-        # enforce max_files cap (should already be true, but keep as a hard guard)
         selected_in_repo = selected_in_repo[: caps["max_files"]]
 
-        # deterministic de-dupe while preserving order
         seen: set[str] = set()
         final_plan: list[str] = []
         for p in selected_in_repo:
@@ -479,7 +537,6 @@ def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
             seen.add(p)
             final_plan.append(p)
 
-        # add final-plan length info
         plan_debug = dict(plan_debug or {})
         plan_debug["final_plan_len_after_repo_gate"] = len(final_plan)
         plan_debug["caps_max_files"] = int(caps.get("max_files", 0))
@@ -496,12 +553,12 @@ def node_pass2_make_read_plan(state: SnapshotterState) -> SnapshotterState:
 
 def node_pass2_fetch_files(state: SnapshotterState) -> SnapshotterState:
     """
-    Pass 2 fetch worker (1.3):
+    Pass 2 fetch worker:
     - reads only selected read_plan paths from local repo clone
     - UTF-8 decode with replacement
     - enforces total char cap across all fetched files
     - optional per-file char cap (truncate per-file)
-    - records files_not_read reasons for selected paths that aren't read
+    - records not_read reasons for selected paths that aren't read
     """
     stage = STAGE_PASS2_FETCH_FILES
     try:
@@ -532,16 +589,13 @@ def node_pass2_fetch_files(state: SnapshotterState) -> SnapshotterState:
                 continue
 
             try:
-                # Case A: per-file cap active AND it fits in remaining budget => allow truncation
                 if max_per_file > 0 and max_per_file <= remaining:
-                    # read up to max_per_file+1 to detect "longer than cap"
                     text, hit = _stream_read_utf8_with_replacement(fp, max_chars=max_per_file + 1)
                     longer_than_cap = hit or (len(text) > max_per_file)
                     if longer_than_cap:
                         text = text[:max_per_file]
                     n = len(text)
 
-                    # should always fit by construction
                     if n > remaining:
                         not_read_reasons[rel] = "exceeds_total_char_cap"
                         continue
@@ -551,7 +605,6 @@ def node_pass2_fetch_files(state: SnapshotterState) -> SnapshotterState:
                     files_read.append({"path": rel, "chars": n, "truncated": bool(longer_than_cap)})
                     continue
 
-                # Case B: must fit fully in remaining budget (no truncation allowed by total-cap rules)
                 text, hit = _stream_read_utf8_with_replacement(fp, max_chars=remaining + 1)
                 too_big = hit or (len(text) > remaining)
                 if too_big:
@@ -585,29 +638,72 @@ def node_pass2_generate_outputs(state: SnapshotterState) -> SnapshotterState:
         repo_index = state["repo_index"]
         resolved_commit = state.get("resolved_commit", "unknown")
 
-        write_json(
-            lp["architecture_snapshot"],
-            _build_architecture_summary_snapshot_stub(
+        files_read = state.get("pass2_files_read", [])
+        not_read_reasons = state.get("pass2_not_read_reasons", {})
+        files_not_read = _compute_files_not_read(
+            repo_index=repo_index,
+            files_read=files_read,
+            read_plan_selected=state.get("read_plan", []),
+            not_read_reasons_for_selected=not_read_reasons,
+        )
+
+        # --- LLM semantic generation (single pass) ---
+        try:
+            arch_raw, gaps_raw, onboarding_md = generate_pass2_semantic_artifacts(
                 repo_url=job.repo_url,
                 resolved_commit=resolved_commit,
                 job_id=job.job_id or "unknown",
                 repo_index=repo_index,
-                read_plan_selected=state.get("read_plan", []),
-                read_plan_missing=state.get("read_plan_missing", []),
-                pass2_caps=state.get("pass2_caps", _pass2_defaults_from_env()),
-                read_plan_source="llm_stub",
-                files_read=state.get("pass2_files_read", []),
-                not_read_reasons=state.get("pass2_not_read_reasons", {}),
-                read_plan_debug=state.get("pass2_read_plan_debug"),
-                pass2_total_chars=state.get("pass2_total_chars", 0),
-            ),
+                files_read=files_read,
+                files_not_read=files_not_read,
+                file_contents_map=state.get("file_contents_map", {}),
+            )
+        except Pass2SemanticError as e:
+            # If pass2_semantic attached raw output, persist it for inspection.
+            raw_text = getattr(e, "raw_text", None)
+            repaired_text = getattr(e, "repaired_text", None)
+
+            raw_path = lp.get("pass2_llm_raw_output") or str(Path(state["out_dir"]) / "PASS2_LLM_RAW_OUTPUT.txt")
+            repaired_path = lp.get("pass2_llm_repaired_output") or str(
+                Path(state["out_dir"]) / "PASS2_LLM_REPAIRED_OUTPUT.txt"
+            )
+
+            try:
+                if isinstance(raw_text, str) and raw_text:
+                    Path(raw_path).write_text(raw_text, encoding="utf-8")
+                if isinstance(repaired_text, str) and repaired_text:
+                    Path(repaired_path).write_text(repaired_text, encoding="utf-8")
+            except Exception:
+                # If debug write fails, still surface the semantic error (do not mask it).
+                pass
+
+            msg = f"pass2_semantic failed: {e}"
+            if isinstance(raw_text, str) and raw_text:
+                msg += f"\nRaw LLM output saved at: {raw_path}"
+            if isinstance(repaired_text, str) and repaired_text:
+                msg += f"\nRepaired LLM output saved at: {repaired_path}"
+            raise RuntimeError(msg) from e
+
+        # Normalize snapshot so it is always spec-valid and self-auditing.
+        arch = _normalize_architecture_snapshot(
+            arch=arch_raw,
+            repo_url=job.repo_url,
+            resolved_commit=resolved_commit,
+            job_id=job.job_id or "unknown",
+            repo_index=repo_index,
+            read_plan_selected=state.get("read_plan", []),
+            read_plan_missing=state.get("read_plan_missing", []),
+            pass2_caps=state.get("pass2_caps", _pass2_defaults_from_env()),
+            read_plan_source="pass2_semantic",
+            read_plan_debug=state.get("pass2_read_plan_debug"),
+            pass2_total_chars=int(state.get("pass2_total_chars", 0)),
+            files_read=files_read,
+            files_not_read=files_not_read,
         )
 
-        write_json(lp["gaps"], _build_gaps_and_inconsistencies_stub(job_id=job.job_id or "unknown"))
-        Path(lp["onboarding"]).write_text(
-            _build_onboarding_stub(repo_url=job.repo_url, resolved_commit=resolved_commit),
-            encoding="utf-8",
-        )
+        write_json(lp["architecture_snapshot"], arch)
+        write_json(lp["gaps"], gaps_raw)
+        Path(lp["onboarding"]).write_text(onboarding_md or "", encoding="utf-8")
 
         state["stage"] = stage
         return state
