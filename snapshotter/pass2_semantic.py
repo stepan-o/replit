@@ -431,6 +431,40 @@ def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]
     return out
 
 
+def _known_present_route_hints(repo_paths: set[str]) -> dict[str, Any]:
+    """
+    Tiny, high-signal presence hints to prevent 'not found in snapshot' hallucinations
+    when the file exists but wasn't included in the LLM pack.
+    Kept intentionally small to avoid prompt bloat.
+    """
+    hints: dict[str, Any] = {}
+
+    login_files = []
+    for p in (
+        "frontend/app/login/page.tsx",
+        "frontend/app/login/LoginPageClient.tsx",
+        "frontend/app/login/loginpageclient.tsx",
+    ):
+        if p in repo_paths:
+            login_files.append(p)
+    if login_files:
+        hints["login_route_present"] = True
+        hints["login_route_files"] = login_files
+
+    cs_files = []
+    for p in (
+        "frontend/app/case-studies/page.tsx",
+        "frontend/app/case-studies/layout.tsx",
+    ):
+        if p in repo_paths:
+            cs_files.append(p)
+    if cs_files:
+        hints["case_studies_route_present"] = True
+        hints["case_studies_route_files"] = cs_files
+
+    return hints
+
+
 # -------------------------------------------------------------------
 # File selection (architecture + onboarding)
 # -------------------------------------------------------------------
@@ -485,6 +519,22 @@ def _select_files_for_architecture(
             s += 700
         if pl in ("frontend/app/layout.tsx", "frontend/app/layout.ts"):
             s += 620
+
+        # ---- guardrails for common false "missing route" hallucinations ----
+        # login route: ensure included if present in file_contents_map
+        if pl.startswith("frontend/app/login/"):
+            s += 900
+        if pl == "frontend/app/login/page.tsx":
+            s += 1200
+        if pl == "frontend/app/login/loginpageclient.tsx":
+            s += 800
+
+        # case-studies route: ensure included if present in file_contents_map
+        if "frontend/app/case-studies/" in pl:
+            s += 800
+        if pl == "frontend/app/case-studies/page.tsx":
+            s += 1100
+        # -------------------------------------------------------------------
 
         # backend clusters
         if pl.startswith("backend/routers/"):
@@ -605,6 +655,13 @@ def _select_supporting_files_for_gaps_and_onboarding(
             s += 80
         if p_low.endswith(("package.json", "tsconfig.json", "jsconfig.json")):
             s += 75
+
+        # keep these high so gaps pass has grounding if it wants to mention them
+        if p_low.startswith("frontend/app/login/"):
+            s += 120
+        if "frontend/app/case-studies/" in p_low:
+            s += 110
+
         if p_low.endswith((".ts", ".tsx")):
             s += 10
         if p_low.endswith((".py",)):
@@ -655,6 +712,9 @@ def _build_architecture_payload(
     if not isinstance(path_aliases, dict):
         path_aliases = {}
 
+    repo_paths = _repo_paths_set(repo_index)
+    presence_hints = _known_present_route_hints(repo_paths)
+
     # Keep pass1 counts/signals only; do NOT inject deps_by_file into the prompt.
     return {
         "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
@@ -668,6 +728,11 @@ def _build_architecture_payload(
                 "Do NOT output dependency lists, file inventories, read plans, or audit appendices. "
                 "This pass is semantic: boundaries, runtime entrypoints, key flows."
             ),
+            # critical: stop claiming 'missing from snapshot' when it's only missing from the pack
+            "missing_claims_rule": (
+                "You can only claim a feature/file is 'missing from the snapshot' if it is absent from repo_presence_hints. "
+                "If you did not see a file in pass2.files, say 'not included in provided file contents' instead of 'missing from repo'."
+            ),
         },
         "pass1": {
             "counts": repo_index.get("counts", {}),
@@ -678,6 +743,8 @@ def _build_architecture_payload(
                 "package_json": signals.get("package_json", {}),
             },
         },
+        # tiny presence hints only (do not dump full repo path list)
+        "repo_presence_hints": presence_hints,
         "pass2": {"files": files_pack},
         "output_contract": {
             "return_json_object_with_keys": ["modules", "uncertainties"],
@@ -705,7 +772,9 @@ def _architecture_prompt_text(payload: dict[str, Any]) -> str:
         "1) Each module MUST include anchor_paths (3–10) and they MUST be a subset of pass2.files[].path.\n"
         "2) summary must be grounded in anchor_paths. If unsure, set responsibilities=['unknown'] and add an uncertainty.\n"
         "3) Do NOT output dependency lists, read plans, file inventories, or other appendices.\n"
-        "4) Keep output concise and onboarding-useful: define boundaries, runtime entrypoints, and key flows.\n\n"
+        "4) Keep output concise and onboarding-useful: define boundaries, runtime entrypoints, and key flows.\n"
+        "5) IMPORTANT: If you did not see a file in pass2.files, do NOT claim it is missing from the repo snapshot.\n"
+        "   Instead say it was not included in the provided file contents.\n\n"
         "Style guidance:\n"
         "- Prefer ~6–14 modules total.\n"
         "- Use module.type from: ['frontend','backend','shared_lib','db','jobs','infra','tooling','docs','unknown'].\n"
@@ -753,6 +822,9 @@ def _build_gaps_onboarding_payload(
     env_vars = signals.get("env_vars", [])
     pkg = signals.get("package_json", {})
 
+    repo_paths = _repo_paths_set(repo_index)
+    presence_hints = _known_present_route_hints(repo_paths)
+
     return {
         "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
         "rules": {
@@ -761,6 +833,10 @@ def _build_gaps_onboarding_payload(
             "onboarding_md_goal": (
                 "Write onboarding_md as a practical architect handoff: quickstart, entrypoints, boundaries, "
                 "data/state flow, configuration surface (env vars), and common change locations."
+            ),
+            "missing_claims_rule": (
+                "Do NOT claim routes/pages are missing from the repo snapshot unless repo_presence_hints indicates absent. "
+                "If missing from supporting_files, say it was not included in provided file contents."
             ),
         },
         "pass1": {
@@ -772,6 +848,7 @@ def _build_gaps_onboarding_payload(
                 "package_json": pkg,
             },
         },
+        "repo_presence_hints": presence_hints,
         "architecture_summary": {
             "modules": modules_summary,
             "uncertainties": arch_uncertainties,
@@ -796,7 +873,9 @@ def _gaps_onboarding_prompt_text(payload: dict[str, Any]) -> str:
         "1) gaps must include keys: generated_at, job_id, items (array).\n"
         "2) Do NOT duplicate deterministic gaps already listed in deterministic_gaps_already_found.\n"
         "3) If onboarding_enabled is false, set onboarding_md to an empty string.\n"
-        "4) Keep it concise and self-auditing.\n\n"
+        "4) Keep it concise and self-auditing.\n"
+        "5) IMPORTANT: Do NOT say 'missing from repo snapshot' unless repo_presence_hints indicates absent. "
+        "If you didn't see a file in supporting_files, say it was not included in provided file contents.\n\n"
         "Onboarding MD requirements (if enabled):\n"
         "- Must include sections: Overview, Entry points, Configuration (env vars), Common tasks, Where to change code, Risks/footguns.\n"
         "- Use file paths when referencing code.\n\n"
@@ -1016,7 +1095,7 @@ def _post_enforce_architecture_constraints(
 
 
 # -------------------------------------------------------------------
-# Gaps normalization / dedupe
+# Gaps normalization / dedupe + false-positive rewrite
 # -------------------------------------------------------------------
 
 
@@ -1064,6 +1143,10 @@ def _dedupe_gap_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _fix_false_missing_route_gap_items(items: list[dict[str, Any]], allowed_paths: set[str]) -> list[dict[str, Any]]:
+    """
+    If an item claims route/docs missing but those referenced files exist (in allowed_paths),
+    rewrite it to a check-style item instead of 'missing'.
+    """
     out: list[dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
@@ -1088,6 +1171,128 @@ def _fix_false_missing_route_gap_items(items: list[dict[str, Any]], allowed_path
     return out
 
 
+def _rewrite_known_false_missing_items(items: list[dict[str, Any]], repo_paths: set[str]) -> list[dict[str, Any]]:
+    """
+    Downgrade/convert known false positives caused by prompt coverage rather than repo reality,
+    notably /login and /case-studies.
+    """
+    has_login = ("frontend/app/login/page.tsx" in repo_paths) or ("frontend/app/login/LoginPageClient.tsx" in repo_paths)
+    has_case_studies = "frontend/app/case-studies/page.tsx" in repo_paths
+
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        desc = (it.get("description") or "")
+        desc_l = desc.lower()
+        t = (it.get("type") or "").strip()
+
+        def _files_list() -> list[str]:
+            fi = it.get("files_involved")
+            if not isinstance(fi, list):
+                return []
+            return [p for p in fi if isinstance(p, str) and p]
+
+        # /login false "missing"
+        if has_login and ("/login" in desc_l or "login page" in desc_l):
+            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in ("incomplete_extraction", "missing_docs"):
+                it2 = dict(it)
+                it2["type"] = "prompt_coverage_gap"
+                it2["severity"] = "low"
+                it2["description"] = (
+                    "Login route exists in snapshot (frontend/app/login/page.tsx + LoginPageClient.tsx). "
+                    "Prior pass likely omitted these files from the LLM evidence pack; treat as prompt coverage issue, not missing implementation."
+                )
+                files = _files_list()
+                for p in ("frontend/app/login/page.tsx", "frontend/app/login/LoginPageClient.tsx"):
+                    if p in repo_paths and p not in files:
+                        files.append(p)
+                it2["files_involved"] = files
+                out.append(it2)
+                continue
+
+        # /case-studies false "missing"
+        if has_case_studies and ("/case-studies" in desc_l or "case studies" in desc_l):
+            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in ("missing_docs", "incomplete_extraction"):
+                it2 = dict(it)
+                it2["type"] = "prompt_coverage_gap"
+                it2["severity"] = "low"
+                it2["description"] = (
+                    "Case studies route exists in snapshot (frontend/app/case-studies/page.tsx). "
+                    "Prior pass likely omitted this file from the LLM evidence pack; treat as prompt coverage issue, not missing route."
+                )
+                files = _files_list()
+                if "frontend/app/case-studies/page.tsx" not in files:
+                    files.append("frontend/app/case-studies/page.tsx")
+                it2["files_involved"] = files
+                out.append(it2)
+                continue
+
+        out.append(it)
+
+    return out
+
+
+def _rewrite_known_false_missing_uncertainties(uncertainties: list[dict[str, Any]], repo_paths: set[str]) -> list[dict[str, Any]]:
+    """
+    Same as gaps rewrite but for architecture 'uncertainties' objects.
+    """
+    has_login = ("frontend/app/login/page.tsx" in repo_paths) or ("frontend/app/login/LoginPageClient.tsx" in repo_paths)
+    has_case_studies = "frontend/app/case-studies/page.tsx" in repo_paths
+
+    out: list[dict[str, Any]] = []
+    for u in uncertainties:
+        if not isinstance(u, dict):
+            continue
+        desc = (u.get("description") or "")
+        desc_l = desc.lower()
+        typ = (u.get("type") or "").strip()
+
+        files_involved = u.get("files_involved")
+        if not isinstance(files_involved, list):
+            files_involved = []
+        files_involved = [p for p in files_involved if isinstance(p, str) and p]
+
+        # login uncertainty false positive
+        if has_login and ("/login" in desc_l or "login page" in desc_l) and ("not found" in desc_l or "unknown" in desc_l):
+            u2 = dict(u)
+            u2["type"] = "prompt_coverage_gap"
+            u2["description"] = (
+                "Login route exists in snapshot (frontend/app/login/page.tsx + LoginPageClient.tsx). "
+                "If this was flagged as missing/unknown, it was likely not included in the provided file contents."
+            )
+            for p in ("frontend/app/login/page.tsx", "frontend/app/login/LoginPageClient.tsx"):
+                if p in repo_paths and p not in files_involved:
+                    files_involved.append(p)
+            u2["files_involved"] = files_involved
+            u2["suggested_questions"] = [
+                "Ensure login route files are included in pass2 selection and cited as anchor_paths where relevant."
+            ]
+            out.append(u2)
+            continue
+
+        # case-studies uncertainty false positive
+        if has_case_studies and ("/case-studies" in desc_l or "case studies" in desc_l) and ("not found" in desc_l or "unknown" in desc_l):
+            u2 = dict(u)
+            u2["type"] = "prompt_coverage_gap"
+            u2["description"] = (
+                "Case studies route exists in snapshot (frontend/app/case-studies/page.tsx). "
+                "If this was flagged as missing/unknown, it was likely not included in the provided file contents."
+            )
+            if "frontend/app/case-studies/page.tsx" not in files_involved:
+                files_involved.append("frontend/app/case-studies/page.tsx")
+            u2["files_involved"] = files_involved
+            u2["suggested_questions"] = [
+                "Ensure case-studies route file is included in pass2 selection and cited where navigation references it."
+            ]
+            out.append(u2)
+            continue
+
+        out.append(u)
+
+    return out
+
+
 # -------------------------------------------------------------------
 # Public API
 # -------------------------------------------------------------------
@@ -1108,6 +1313,11 @@ def generate_pass2_semantic_artifacts(
       - Pass2 LLM outputs ONLY: semantic modules + anchor_paths + short text
       - evidence_paths and dependencies are derived deterministically after the fact
       - no LLM dependency reconciliation, no dependency_mismatch gap spam
+
+    Fixes included:
+      - Boost selection for /login and /case-studies files so they land in the LLM pack
+      - Explicit prompt rule: don't claim "missing from snapshot" if merely missing from provided contents
+      - Deterministic rewrite of known false-positive 'missing' gaps/uncertainties for /login + /case-studies
     """
     caps = _semantic_caps_from_env()
 
@@ -1132,6 +1342,7 @@ def generate_pass2_semantic_artifacts(
     )
 
     allowed_paths = set(file_contents_map.keys())
+    repo_paths = _repo_paths_set(repo_index)
 
     enforced_modules, enforced_uncertainties = _post_enforce_architecture_constraints(
         modules=arch_obj.get("modules", []),
@@ -1142,6 +1353,9 @@ def generate_pass2_semantic_artifacts(
     # deterministically attach deps (and evidence_paths := anchor_paths for compat)
     deps_by_file = _extract_pass1_deps(repo_index)
     enforced_modules = _derive_deps_from_anchor_paths(enforced_modules, deps_by_file)
+
+    # rewrite known false-positive uncertainties (prompt coverage vs repo reality)
+    enforced_uncertainties = _rewrite_known_false_missing_uncertainties(enforced_uncertainties, repo_paths)
 
     arch_out: dict[str, Any] = {
         "modules": enforced_modules,
@@ -1188,6 +1402,10 @@ def generate_pass2_semantic_artifacts(
             if isinstance(it, dict):
                 merged_items.append(it)
 
+    # rewrite known false positives caused by prompt coverage
+    merged_items = _rewrite_known_false_missing_items(merged_items, repo_paths)
+
+    # keep existing rewrite for 'missing_route' items (but operate on allowed_paths)
     merged_items = _fix_false_missing_route_gap_items(merged_items, allowed_paths)
 
     gaps_out = dict(gaps_raw)
